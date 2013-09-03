@@ -179,10 +179,14 @@ import cs.internal.Function;
 		return v != null && (v is haxe.lang.Enum || v is System.Enum);
 	')
 	public static function isEnumValue( v : Dynamic ) : Bool {
+        #if wp7
+        return false;
+        #else
 		return switch(Type.typeof(v)) {
 			case TEnum(_): true;
 			case _: false;
 		}
+        #end
 	}
 
 	@:functionCode('
