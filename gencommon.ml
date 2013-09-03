@@ -177,7 +177,7 @@ rules were devised:
 (* ******************************************* *)
 
 let assertions = false (* when assertions == true, many assertions will be made to guarantee the quality of the data input *)
-let debug_mode = ref false
+let debug_mode = ref true
 let trace s = if !debug_mode then print_endline s else ()
 let timer name = if !debug_mode then Common.timer name else fun () -> ()
 
@@ -4614,7 +4614,7 @@ struct
       | TUnop (Ast.Increment, _, _)
       | TUnop (Ast.Decrement, _, _) (* unop is a special case because the haxe compiler won't let us generate complex expressions with Increment/Decrement *)
       | TBlock _ -> expr (* there is no expected expression here. Only statements *)
-      | _ -> assert false (* we only expect valid statements here. other expressions aren't valid statements *)
+      | _ -> trace (debug_expr expr); print_endline ("In: " ^ (expr.epos.pfile) ^ " min:" ^ string_of_int(expr.epos.pmin) ^ " max: " ^ string_of_int(expr.epos.pmax)  ); assert false (* we only expect valid statements here. other expressions aren't valid statements *)
 
   let is_expr = function | Expression _ -> true | _ -> false
 
