@@ -4615,7 +4615,6 @@ struct
       | TBlock _ -> expr (* there is no expected expression here. Only statements *)
       | TMeta(m,e) ->
         { expr with eexpr = TMeta(m,expr_stat_map fn e) }
-      | _ -> assert false (* we only expect valid statements here. other expressions aren't valid statements *)
       | _ -> trace (debug_expr expr); print_endline ("In: " ^ (expr.epos.pfile) ^ " min:" ^ string_of_int(expr.epos.pmin) ^ " max: " ^ string_of_int(expr.epos.pmax)  ); assert false (* we only expect valid statements here. other expressions aren't valid statements *)
 
   let is_expr = function | Expression _ -> true | _ -> false
