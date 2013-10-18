@@ -623,8 +623,11 @@ let check_private_path ctx t = match t with
 		()
 
 (* Removes generic base classes *)
+
+let is_removable_class c = c.cl_kind = KGeneric && (has_ctor_constraint c || Meta.has Meta.Remove c.cl_meta)
+
 let remove_generic_base ctx t = match t with
-	| TClassDecl c when c.cl_kind = KGeneric && has_ctor_constraint c ->
+	| TClassDecl c when is_removable_class c ->
 		c.cl_extern <- true
 	| _ ->
 		()
@@ -732,7 +735,7 @@ let add_field_inits ctx t =
 				(cf2 :: inits, fields)
 			| _ -> (inits, cf :: fields)
 		) ([],[]) c.cl_ordered_fields in
-		c.cl_ordered_fields <- fields;
+		c.cl_ordered_fields <- (List.rev fields);
 		match inits with
 		| [] -> ()
 		| _ ->
@@ -823,6 +826,105 @@ let promote_abstract_parameters ctx t = match t with
 		()
 
 (*
+	- wraps implicit blocks in TIf, TFor, TWhile, TFunction and TTry with real ones
+*)
+let rec blockify_ast e =
+	match e.eexpr with
+	| TIf(e1,e2,eo) ->
+		{e with eexpr = TIf(blockify_ast e1,mk_block (blockify_ast e2),match eo with None -> None | Some e -> Some (mk_block (blockify_ast e)))}
+	| TFor(v,e1,e2) ->
+		{e with eexpr = TFor(v,blockify_ast e1,mk_block (blockify_ast e2))}
+	| TWhile(e1,e2,flag) ->
+		{e with eexpr = TWhile(blockify_ast e1,mk_block (blockify_ast e2),flag)}
+	| TFunction tf ->
+		{e with eexpr = TFunction {tf with tf_expr = mk_block (blockify_ast tf.tf_expr)}}
+	| TTry(e1,cl) ->
+		{e with eexpr = TTry(blockify_ast e1,List.map (fun (v,e) -> v,mk_block (blockify_ast e)) cl)}
+	| _ ->
+		Type.map_expr blockify_ast e
+
+let handle_side_effects com gen_temp e =
+	let block_el = ref [] in
+	let push e = block_el := e :: !block_el in
+	let declare_temp t eo p =
+		let v = gen_temp t in
+		begin match follow t,eo with
+			| TAbstract({a_path=[],"Void"},_),Some e -> com.warning (s_expr (s_type (print_context())) e) p;
+			| _ -> ()
+		end;
+		let e = mk (TVars [v,eo]) com.basic.tvoid p in
+		push e;
+		mk (TLocal v) t p
+	in
+	let push_block () =
+		let cur = !block_el in
+		block_el := [];
+		fun () ->
+			let added = !block_el in
+			block_el := cur;
+			List.rev added
+	in
+	let rec block f el =
+		let close = push_block() in
+		List.iter (fun e ->
+			push (f e)
+		) el;
+		close()
+	in
+	let rec loop e =
+		match e.eexpr with
+		| TBlock el ->
+			{e with eexpr = TBlock (block loop el)}
+		| TCall(e1,el) ->
+			{e with eexpr = TCall(loop e1,ordered_list el)}
+		| TNew(c,tl,el) ->
+			{e with eexpr = TNew(c,tl,ordered_list el)}
+		| TArrayDecl el ->
+			{e with eexpr = TArrayDecl (ordered_list el)}
+		| TObjectDecl fl ->
+			let el = ordered_list (List.map snd fl) in
+			{e with eexpr = TObjectDecl (List.map2 (fun (n,_) e -> n,e) fl el)}
+		| _ ->
+			Type.map_expr loop e
+	and ordered_list el =
+		let had_side_effect = ref false in
+		let rec no_side_effect e = match e.eexpr with
+			| TNew _ | TCall _ | TArrayDecl _ | TObjectDecl _ | TBinop ((OpAssignOp _ | OpAssign),_,_) | TUnop ((Increment|Decrement),_,_) ->
+				if !had_side_effect then
+					declare_temp e.etype (Some (loop e)) e.epos
+				else begin
+					had_side_effect := true;
+					e
+				end
+			| TConst _ | TLocal _ | TTypeExpr _ | TFunction _
+			| TReturn _ | TBreak | TContinue | TThrow _ | TCast (_,Some _) ->
+				e
+			| TBlock _ ->
+				loop e
+			| _ ->
+				Type.map_expr no_side_effect e
+		in
+		let rec loop2 acc el = match el with
+			| e :: el ->
+				let e = no_side_effect e in
+				if !had_side_effect then
+					(List.map no_side_effect (List.rev el)) @ e :: acc
+				else
+					loop2 (e :: acc) el
+			| [] ->
+				acc
+		in
+		List.map loop (loop2 [] (List.rev el))
+	in
+	let e = blockify_ast e in
+	let e = loop e in
+	match !block_el with
+		| [] ->
+			e
+		| el ->
+			mk (TBlock (List.rev (e :: el))) e.etype e.epos
+
+(*
 	Pushes complex right-hand side expression inwards.
 
 	return { exprs; value; } -> { exprs; return value; }
@@ -831,9 +933,9 @@ let promote_abstract_parameters ctx t = match t with
 *)
 let promote_complex_rhs ctx e =
 	let rec is_complex e = match e.eexpr with
-		| TBlock _ | TSwitch _ | TIf _ | TTry _ -> true
+		| TBlock _ | TSwitch _ | TIf _ | TTry _ | TCast(_,Some _) -> true
 		| TBinop(_,e1,e2) -> is_complex e1 || is_complex e2
-		| TParenthesis e | TMeta(_,e) -> is_complex e
+		| TParenthesis e | TMeta(_,e) | TCast(e, None) -> is_complex e
 		| _ -> false
 	in
 	let rec loop f e = match e.eexpr with
@@ -854,6 +956,8 @@ let promote_complex_rhs ctx e =
 			{ e with eexpr = TMeta(m,loop f e1)}
 		| TReturn _ | TThrow _ ->
 			find e
+		| TCast(e1,None) when ctx.config.pf_ignore_unsafe_cast ->
+			loop f e1
 		| _ ->
 			f (find e)
 	and block el =
@@ -1522,28 +1626,29 @@ module Abstract = struct
 	let check_cast ctx tleft eright p =
 		if ctx.com.display then eright else do_check_cast ctx tleft eright p
 
+	let find_multitype_specialization a pl p =
+		let m = mk_mono() in
+		let at = apply_params a.a_types pl a.a_this in
+		let _,cfo =
+			try find_to a pl m
+			with Not_found ->
+				let st = s_type (print_context()) at in
+				if has_mono at then
+					error ("Type parameters of multi type abstracts must be known (for " ^ st ^ ")") p
+				else
+					error ("Abstract " ^ (s_type_path a.a_path) ^ " has no @:to function that accepts " ^ st) p;
+		in
+		match cfo with
+			| None -> assert false
+			| Some cf -> cf, follow m
+
 	let handle_abstract_casts ctx e =
 		let rec loop ctx e = match e.eexpr with
 			| TNew({cl_kind = KAbstractImpl a} as c,pl,el) ->
-				(* a TNew of an abstract implementation is only generated if it is a generic abstract *)
-				let at = apply_params a.a_types pl a.a_this in
-				let m = mk_mono() in
-				let _,cfo =
-					try find_to a pl m
-					with Not_found ->
-						let st = s_type (print_context()) at in
-						if has_mono at then
-							error ("Type parameters of multi type abstracts must be known (for " ^ st ^ ")") e.epos
-						else
-							error ("Abstract " ^ (s_type_path a.a_path) ^ " has no @:to function that accepts " ^ st) e.epos;
-				in
-				begin match cfo with
-				| None -> assert false
-				| Some cf ->
-					let m = follow m in
-					let e = make_static_call ctx c cf a pl ((mk (TConst TNull) (TAbstract(a,pl)) e.epos) :: el) m e.epos in
-					{e with etype = m}
-				end
+				(* a TNew of an abstract implementation is only generated if it is a multi type abstract *)
+				let cf,m = find_multitype_specialization a pl e.epos in
+				let e = make_static_call ctx c cf a pl ((mk (TConst TNull) (TAbstract(a,pl)) e.epos) :: el) m e.epos in
+				{e with etype = m}
 			| TCall(e1, el) ->
 				begin try
 					begin match e1.eexpr with
@@ -1706,6 +1811,7 @@ let post_process ctx filters t =
 	if m.m_processed = 0 then m.m_processed <- !pp_counter;
 	if m.m_processed = !pp_counter then
 	match t with
+	| TClassDecl c when is_removable_class c -> ()
 	| TClassDecl c ->
 		let process_field f =
 			match f.cf_expr with

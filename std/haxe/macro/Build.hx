@@ -37,12 +37,16 @@ class Build {
 		var tThis = a.get().type;
 		var ctA = TAbstract(a, []).toComplexType();
 		for (field in fields) {
-			field.access = [AStatic,APublic,AInline];
+			// allow extra static fields
+			if( Lambda.has(field.access,AStatic) )
+				continue;
 			switch(field.kind) {
 				case FVar(t, e):
+					field.access = [AStatic,APublic,AInline];
 					if (e == null) Context.error("Value required", field.pos);
 					var tE = Context.typeof(e);
 					if (!Context.unify(tE, tThis)) Context.error('${tE.toString()} should be ${tThis.toString()}', e.pos);
+					field.meta.push({name: ":impl", params: [], pos: field.pos});
 					field.kind = FVar(ctA, macro cast $e);
 				case _:
 			}
@@ -68,14 +72,14 @@ class Build {
 				c;
 			case _: Context.error("Underlying type of exposing abstract must be a class", Context.currentPos());
 		}
-		function getIdentName(e) return switch(e.expr) {
-			case EConst(CIdent(s)): s;
-			case _: Context.error("Identifier expected", e.pos);
+		function getIdentNames(e) return switch(e.expr) {
+			case EConst(CIdent(s)): { field : s, newField : s };
+			case EBinop(OpArrow, { expr : EConst(CIdent(s1))}, { expr: EConst(CIdent(s2))}): { field: s1, newField : s2 };
+			case _: Context.error("Identifier or (Identifier => Identifier) expected", e.pos);
 		}
-		function toField(cf:ClassField) {
-			var name = cf.name;
+		function toField(cf:ClassField, oldName:String, newName:String) {
 			return {
-				name: name,
+				name: newName,
 				doc: cf.doc,
 				access: [AStatic, APublic, AInline],
 				pos: cf.pos,
@@ -88,7 +92,7 @@ class Build {
 							type: arg.t.toComplexType(),
 							value: null
 						});
-						var expr = macro return this.$name($a{args.map(function(arg) return macro $i{arg.name})});
+						var expr = macro return this.$oldName($a{args.map(function(arg) return macro $i{arg.name})});
 						args.unshift({name: "this", type: null, opt:false, value: null});
 						FFun({
 							args: args,
@@ -105,7 +109,8 @@ class Build {
 			}
 		}
 		for (fieldExpr in fieldExprs) {
-			var fieldName = getIdentName(fieldExpr);
+			var fieldNames = getIdentNames(fieldExpr);
+			var fieldName = fieldNames.field;
 			var cField = c.findField(fieldName, false);
 			if (cField == null) Context.error('Underlying type has no field $fieldName', fieldExpr.pos);
 			switch(cField.kind) {
@@ -113,7 +118,7 @@ class Build {
 				case _: Context.error("Only function fields can be exposed", fieldExpr.pos);
 			}
 			cField.type = map(cField.type);
-			var field = toField(cField);
+			var field = toField(cField, fieldName, fieldNames.newField);
 			fields.push(field);
 		}
 		return fields;

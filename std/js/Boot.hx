@@ -41,8 +41,8 @@ class Boot {
 			var d;
 			if( __js__("typeof")(document) != "undefined" && (d = document.getElementById("haxe:trace")) != null )
 				d.innerHTML += __unhtml(msg)+"<br/>";
-			else if( __js__("typeof")(console) != "undefined" && console.log != null )
-				console.log(msg);
+			else if( __js__("typeof console") != "undefined" && __js__("console").log != null )
+				__js__("console").log(msg);
 			#end
 		}
 	}
@@ -159,7 +159,7 @@ class Boot {
 		return __interfLoop(cc.__super__,cl);
 	}
 
-	@:ifFeature("typed_catch", "typed_cast") private static function __instanceof(o : Dynamic,cl : Dynamic) {
+	@:ifFeature("typed_catch") private static function __instanceof(o : Dynamic,cl : Dynamic) {
 		if( cl == null )
 			return false;
 		switch( cl ) {

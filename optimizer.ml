@@ -33,9 +33,9 @@ let has_side_effect e =
 	let rec loop e =
 		match e.eexpr with
 		| TConst _ | TLocal _ | TField _ | TTypeExpr _ | TFunction _ -> ()
-		| TPatMatch _ | TNew _ | TCall _ | TEnumParameter _ | TBinop ((OpAssignOp _ | OpAssign),_,_) | TUnop ((Increment|Decrement),_,_) -> raise Exit
+		| TPatMatch _ | TNew _ | TCall _ | TBinop ((OpAssignOp _ | OpAssign),_,_) | TUnop ((Increment|Decrement),_,_) -> raise Exit
 		| TReturn _ | TBreak | TContinue | TThrow _ | TCast (_,Some _) -> raise Exit
-		| TArray _ | TCast (_,None) | TBinop _ | TUnop _ | TParenthesis _ | TMeta _ | TWhile _ | TFor _ | TIf _ | TTry _ | TSwitch _ | TArrayDecl _ | TVars _ | TBlock _ | TObjectDecl _ -> Type.iter loop e
+		| TArray _ | TEnumParameter _ | TCast (_,None) | TBinop _ | TUnop _ | TParenthesis _ | TMeta _ | TWhile _ | TFor _ | TIf _ | TTry _ | TSwitch _ | TArrayDecl _ | TVars _ | TBlock _ | TObjectDecl _ -> Type.iter loop e
 	in
 	try
 		loop e; false
@@ -161,7 +161,7 @@ let rec type_inline ctx cf f ethis params tret config p force =
 				if we pass a Null<T> var to an inlined method that needs a T.
 				we need to force a local var to be created on some platforms.
 			*)
-			if ctx.com.config.pf_static && not (is_nullable v.v_type) && is_null e.etype then (local v).i_write <- true;
+			if ctx.com.config.pf_static && not (is_nullable v.v_type) && is_null e.etype then (local v).i_force_temp <- true;
 			(*
 				if we cast from Dynamic, create a local var as well to do the cast
 				once and allow DCE to perform properly.
@@ -382,7 +382,7 @@ let rec type_inline ctx cf f ethis params tret config p force =
 
 		This could be fixed with better post process code cleanup (planed)
 	*)
-	if !cancel_inlining || (Common.platform ctx.com Js && not !force && (init <> None || !has_vars)) then
+	if !cancel_inlining then
 		None
 	else
 		let wrap e =
@@ -807,7 +807,7 @@ let rec reduce_loop ctx e =
 	let e = Type.map_expr (reduce_loop ctx) e in
 	let check_float op f1 f2 =
 		let f = op f1 f2 in
-		let fstr = string_of_float f in
+		let fstr = float_repres f in
 		if (match classify_float f with FP_nan | FP_infinite -> false | _ -> float_of_string fstr = f) then { e with eexpr = TConst (TFloat fstr) } else e
 	in
 	sanitize_expr ctx.com (match e.eexpr with
@@ -831,6 +831,16 @@ let rec reduce_loop ctx e =
 			(match op with
 			| OpEq -> { e with eexpr = TConst (TBool true) }
 			| OpNotEq -> { e with eexpr = TConst (TBool false) }
+			| _ -> e)
+		| TFunction _, TConst TNull ->
+			(match op with
+			| OpEq -> { e with eexpr = TConst (TBool false) }
+			| OpNotEq -> { e with eexpr = TConst (TBool true) }
+			| _ -> e)
+		| TConst TNull, TFunction _ ->
+			(match op with
+			| OpEq -> { e with eexpr = TConst (TBool false) }
+			| OpNotEq -> { e with eexpr = TConst (TBool true) }
 			| _ -> e)
 		| TConst (TInt a), TConst (TInt b) ->
 			let opt f = try { e with eexpr = TConst (TInt (f a b)) } with Exit -> e in
@@ -936,7 +946,7 @@ let rec reduce_loop ctx e =
 		| NegBits, TConst (TInt i) -> { e with eexpr = TConst (TInt (Int32.lognot i)) }
 		| Neg, TConst (TFloat f) ->
 			let v = 0. -. float_of_string f in
-			let vstr = string_of_float v in
+			let vstr = float_repres v in
 			if float_of_string vstr = v then
 				{ e with eexpr = TConst (TFloat vstr) }
 			else
