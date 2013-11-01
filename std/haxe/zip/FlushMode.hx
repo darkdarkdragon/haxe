@@ -19,8 +19,12 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
  */
-package java;
+package haxe.zip;
 
-@:notNull @:runtimeValue @:coreType abstract Int8 from Int {}
-@:notNull @:runtimeValue @:coreType abstract Int16 from Int {}
-@:notNull @:runtimeValue @:coreType abstract Char16 from Int {}
+enum FlushMode {
+	NO;
+	SYNC;
+	FULL;
+	FINISH;
+	BLOCK;
+}

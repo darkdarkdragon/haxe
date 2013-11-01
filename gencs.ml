@@ -2354,3 +2354,440 @@ let generate con =
     con.error ("Error. Module '" ^ (path_s path) ^ "' is required and was not included in build.")  Ast.null_pos);
   debug_mode := false
 
+(* -net-lib implementation *)
+open IlData
+open IlMeta
+
+type net_lib_ctx = {
+	nstd : bool;
+	ncom : Common.context;
+	nil : IlData.ilctx;
+}
+
+let netname_to_hx name =
+	let len = String.length name in
+	let chr = String.get name 0 in
+	String.make 1 (Char.uppercase chr) ^ (String.sub name 1 (len-1))
+
+let hxpath_to_net ctx path =
+	try
+		Hashtbl.find ctx.ncom.net_path_map path
+	with
+	 | Not_found ->
+			[],[],"Not_found"
+
+let netpath_to_hx std = function
+	| [],[], cl -> [], cl
+	| ns,[], cl ->
+		let ns = (List.map String.lowercase ns) in
+		(if std then "cs" :: ns else ns), cl
+	| ns,(nhd :: ntl as nested), cl ->
+		let ns = (List.map String.lowercase ns) @ [nhd] in
+		(if std then "cs" :: ns else ns), String.concat "_" nested ^ "_" ^ cl
+
+let discard_nested = function
+	| (ns,_),cl -> (ns,[]),cl
+
+let mk_type_path ctx path params =
+  let pack, sub, name = match path with
+		| ns,[], cl ->
+			ns, None, cl
+		| ns, (nhd :: ntl as nested), cl ->
+			ns, Some nhd, String.concat "_" nested ^ "_" ^ cl
+	in
+  CTPath {
+		tpackage = fst (netpath_to_hx ctx.nstd (pack,[],""));
+    Ast.tname = name;
+    tparams = params;
+    tsub = sub;
+  }
+
+let rec convert_signature ctx p = function
+	| LVoid ->
+		mk_type_path ctx ([],[],"Void") []
+	| LBool ->
+		mk_type_path ctx ([],[],"Bool") []
+	| LChar ->
+		mk_type_path ctx (["cs"],["StdTypes"],"Char16") []
+	| LInt8 ->
+		mk_type_path ctx (["cs"],["StdTypes"],"Int8") []
+	| LUInt8 ->
+		mk_type_path ctx (["cs"],["StdTypes"],"UInt8") []
+	| LInt16 ->
+		mk_type_path ctx (["cs"],["StdTypes"],"Int16") []
+	| LUInt16 ->
+		mk_type_path ctx (["cs"],["StdTypes"],"UInt16") []
+	| LInt32 ->
+		mk_type_path ctx ([],[],"Int") []
+	| LUInt32 ->
+		mk_type_path ctx ([],[],"UInt") []
+	| LInt64 ->
+		mk_type_path ctx (["haxe"],[],"Int64") []
+	| LUInt64 ->
+		mk_type_path ctx (["haxe"],[],"UInt64") []
+	| LFloat32 ->
+		mk_type_path ctx ([],[],"Single") []
+	| LFloat64 ->
+		mk_type_path ctx ([],[],"Float") []
+	| LString ->
+		mk_type_path ctx ([],[],"String") []
+	| LObject ->
+		mk_type_path ctx ([],[],"Dynamic") []
+	| LPointer s | LManagedPointer s ->
+		mk_type_path ctx (["cs"],[],"Pointer") [ TPType (convert_signature ctx p s) ]
+	| LTypedReference ->
+		mk_type_path ctx (["cs";"system"],[],"TypedReference") []
+	| LIntPtr ->
+		mk_type_path ctx (["cs";"system"],[],"IntPtr") []
+	| LUIntPtr ->
+		mk_type_path ctx (["cs";"system"],[],"UIntPtr") []
+	| LValueType (s,args) | LClass (s,args) ->
+		mk_type_path ctx s (List.map (fun s -> TPType (convert_signature ctx p s)) args)
+	| LTypeParam i ->
+		mk_type_path ctx ([],[],"T" ^ string_of_int i) []
+	| LMethodTypeParam i ->
+		mk_type_path ctx ([],[],"M" ^ string_of_int i) []
+	| LVector s ->
+		mk_type_path ctx (["cs"],[],"NativeArray") [TPType (convert_signature ctx p s)]
+	(* | LArray of ilsig_norm * (int option * int option) array *)
+	| LMethod (_,ret,args) ->
+		CTFunction (List.map (convert_signature ctx p) args, convert_signature ctx p ret)
+	| _ -> mk_type_path ctx ([],[], "Dynamic") []
+
+let ilpath_s = function
+	| ns,[], name -> path_s (ns,name)
+	| [],nested,name -> String.concat "#" nested ^ "." ^ name
+	| ns, nested, name -> String.concat "." ns ^ "." ^ String.concat "#" nested ^ "." ^ name
+
+let get_cls = function
+	| _,_,c -> c
+
+let convert_ilenum ctx p ilcls =
+  let meta = ref [Meta.Native, [EConst (String (ilpath_s ilcls.cpath) ), p], p ] in
+  let data = ref [] in
+  List.iter (fun f -> match f.fname with
+		| "value__" -> ()
+		| _ ->
+      data := { ec_name = f.fname; ec_doc = None; ec_meta = []; ec_args = []; ec_pos = p; ec_params = []; ec_type = None; } :: !data;
+  ) ilcls.cfields;
+	let _, c = netpath_to_hx ctx.nstd ilcls.cpath in
+  EEnum {
+		d_name = netname_to_hx c;
+		d_doc = None;
+		d_params = []; (* enums never have type parameters *)
+		d_meta = !meta;
+		d_flags = [EExtern];
+		d_data = !data;
+  }
+
+let convert_ilfield ctx p field =
+	let p = { p with pfile =  p.pfile ^" (" ^field.fname ^")" } in
+	let cff_doc = None in
+	let cff_pos = p in
+	let cff_meta = ref [] in
+	let cff_name = match field.fname with
+		| name when String.length name > 5 ->
+				(match String.sub name 0 5 with
+				| "__hx_" -> raise Exit
+				| _ -> name)
+		| name -> name
+	in
+	let cff_access = match field.fflags.ff_access with
+		| FAFamily | FAFamOrAssem -> APrivate
+		| FAPublic -> APublic
+		| _ -> raise Exit (* private instances aren't useful on externs *)
+	in
+	let readonly, acc = List.fold_left (fun (readonly,acc) -> function
+		| CStatic -> readonly, AStatic :: acc
+		| CInitOnly | CLiteral -> true, acc
+		| _ -> readonly,acc
+	) (false,[cff_access]) field.fflags.ff_contract in
+	let kind = match readonly with
+		| true ->
+			FProp ("default", "never", Some (convert_signature ctx p field.fsig.snorm), None)
+		| false ->
+			FVar (Some (convert_signature ctx p field.fsig.snorm), None)
+	in
+	let cff_name, cff_meta =
+		if String.get cff_name 0 = '%' then
+			let name = (String.sub cff_name 1 (String.length cff_name - 1)) in
+			"_" ^ name,
+			(Meta.Native, [EConst (String (name) ), cff_pos], cff_pos) :: !cff_meta
+		else
+			cff_name, !cff_meta
+	in
+	{
+		cff_name = cff_name;
+		cff_doc = cff_doc;
+		cff_pos = cff_pos;
+		cff_meta = cff_meta;
+		cff_access = acc;
+		cff_kind = kind;
+	}
+
+let convert_ilmethod ctx p m =
+	let p = { p with pfile =  p.pfile ^" (" ^m.mname ^")" } in
+	let cff_doc = None in
+	let cff_pos = p in
+	let cff_name = match m.mname with
+		| ".ctor" -> "new"
+		| ".cctor"-> raise Exit (* __init__ field *)
+		| name when String.length name > 5 ->
+				(match String.sub name 0 5 with
+				| "__hx_" -> raise Exit
+				| _ -> name)
+		| name -> name
+	in
+	(* Printf.printf "name %s : %s\n" cff_name (IlMetaDebug.ilsig_s m.msig.ssig); *)
+	let acc = match m.mflags.mf_access with
+		| FAFamily | FAFamOrAssem -> APrivate
+		| FAPublic -> APublic
+		| _ -> raise Exit (* private instances aren't useful on externs *)
+	in
+	let acc, is_final = List.fold_left (fun (acc,is_final) -> function
+		| CMStatic when cff_name <> "new" -> AStatic :: acc, is_final
+		| CMVirtual when is_final = None -> acc, Some false
+		| CMFinal -> acc, Some true
+		| _ -> acc, is_final
+	) ([acc],None) m.mflags.mf_contract in
+
+	let meta = [Meta.Overload, [], p] in
+	let meta = match is_final with
+		| None | Some false ->
+			(Meta.Final, [], p) :: meta
+		| _ -> meta
+	in
+	(* let meta = if List.mem OSynchronized m.mflags.mf_interop then *)
+	(* 	(Meta.Synchronized,[],p) :: meta *)
+	(* else *)
+	(* 	meta *)
+	(* in *)
+
+	let kind =
+		let args = List.map (fun (name,flag,s) ->
+			let t = convert_signature ctx p s.snorm in
+			let t = if List.mem PIn flag.pf_io then
+					mk_type_path ctx (["cs"],[],"Ref") [ TPType t ]
+				else if List.mem POut flag.pf_io then
+					mk_type_path ctx (["cs"],[],"Out") [ TPType t ]
+				else
+					t
+			in
+			name,false,Some t,None) m.margs
+		in
+		let ret = convert_signature ctx p m.mret.snorm in
+		let types = List.map (fun t ->
+			{
+				tp_name = "M" ^ string_of_int t.tnumber;
+				tp_params = [];
+				tp_constraints = [];
+			}
+		) m.mtypes in
+		FFun {
+			f_params = types;
+			f_args = args;
+			f_type = Some ret;
+			f_expr = None;
+		}
+	in
+	let cff_name, cff_meta =
+		if String.get cff_name 0 = '%' then
+			let name = (String.sub cff_name 1 (String.length cff_name - 1)) in
+			"_" ^ name,
+			(Meta.Native, [EConst (String (name) ), cff_pos], cff_pos) :: meta
+		else
+			cff_name, meta
+	in
+	{
+		cff_name = cff_name;
+		cff_doc = cff_doc;
+		cff_pos = cff_pos;
+		cff_meta = cff_meta;
+		cff_access = acc;
+		cff_kind = kind;
+	}
+
+let convert_ilprop ctx p prop =
+	let p = { p with pfile =  p.pfile ^" (" ^prop.pname ^")" } in
+	let cff_access = match prop.pmflags with
+		| Some { mf_access = FAFamily | FAFamOrAssem } -> APrivate
+		| Some { mf_access = FAPublic } -> APublic
+		| _ -> raise Exit (* private instances aren't useful on externs *)
+	in
+	let cff_access = match prop.pmflags with
+		| Some m when List.mem CMStatic m.mf_contract ->
+			[AStatic;cff_access]
+		| _ -> [cff_access]
+	in
+	let get = match prop.pget with
+		| None -> "never"
+		| Some s when String.length s <= 4 || String.sub s 0 4 <> "get_" ->
+			raise Exit (* special (?) getter; not used *)
+		| Some _ -> "get"
+	in
+	let set = match prop.pget with
+		| None -> "never"
+		| Some s when String.length s <= 4 || String.sub s 0 4 <> "set_" ->
+			raise Exit (* special (?) getter; not used *)
+		| Some _ -> "set"
+	in
+
+	let kind =
+		FProp (get, set, Some(convert_signature ctx p prop.psig.snorm), None)
+	in
+	{
+		cff_name = prop.pname;
+		cff_doc = None;
+		cff_pos = p;
+		cff_meta = [];
+		cff_access = cff_access;
+		cff_kind = kind;
+	}
+
+let get_type_path ctx ct = match ct with | CTPath p -> p | _ -> assert false
+
+let convert_ilclass ctx p ilcls = match ilcls.csuper with
+	| Some { snorm = LClass ((["System"],[],"Enum"),[]) } ->
+		convert_ilenum ctx p ilcls
+	| _ ->
+		let flags = ref [HExtern] in
+		(* todo: instead of JavaNative, use more specific definitions *)
+		let meta = ref [Meta.CsNative, [], p; Meta.Native, [EConst (String (ilpath_s ilcls.cpath) ), p], p] in
+
+		let is_interface = ref false in
+		List.iter (fun f -> match f with
+			| SSealed -> meta := (Meta.Final, [], p) :: !meta
+			| SInterface ->
+				is_interface := true;
+				flags := HInterface :: !flags
+			| SAbstract -> meta := (Meta.Abstract, [], p) :: !meta
+			| _ -> ()
+		) ilcls.cflags.tdf_semantics;
+
+		(* (match ilcls.cflags.tdf_vis with *)
+		(* 	| VPublic | VNestedFamOrAssem | VNestedFamily -> () *)
+		(* 	| _ -> raise Exit); *)
+		(match ilcls.csuper with
+			| Some { snorm = LClass ( (["System"],[],"Object"), [] ) } -> ()
+			| Some { snorm = LClass ( (["haxe";"lang"],[],"HxObject"), [] ) } ->
+				meta := (Meta.HxGen,[],p) :: !meta
+			| Some s ->
+				flags := HExtends (get_type_path ctx (convert_signature ctx p s.snorm)) :: !flags
+			| _ -> ());
+
+			List.iter (fun i ->
+				match i.snorm with
+				| LClass ( (["haxe";"lang"],[], "IHxObject"), _ ) ->
+					meta := (Meta.HxGen,[],p) :: !meta
+				| i -> flags :=
+					if !is_interface then
+						HExtends (get_type_path ctx (convert_signature ctx p i)) :: !flags
+					else
+						HImplements (get_type_path ctx (convert_signature ctx p i)) :: !flags
+			) ilcls.cimplements;
+
+			let fields = ref [] in
+
+			let run_fields fn f =
+				List.iter (fun f ->
+					try
+						fields := fn f :: !fields
+					with
+						| Exit -> ()
+				) f
+			in
+			run_fields (convert_ilmethod ctx p) ilcls.cmethods;
+			run_fields (convert_ilfield ctx p) ilcls.cfields;
+			run_fields (convert_ilprop ctx p) ilcls.cprops;
+
+			let params = List.map (fun p ->
+				{
+					tp_name = "T" ^ string_of_int p.tnumber;
+					tp_params = [];
+					tp_constraints = [];
+				}) ilcls.ctypes
+			in
+			let _, c = netpath_to_hx ctx.nstd ilcls.cpath in
+			EClass {
+				d_name = netname_to_hx c;
+				d_doc = None;
+				d_params = params;
+				d_meta = !meta;
+				d_flags = !flags;
+				d_data = !fields;
+			}
+
+let add_net_lib com file std =
+	let ilctx = ref None in
+	let netpath_to_hx = netpath_to_hx std in
+	let real_file = ref file in
+	let get_ctx () =
+		match !ilctx with
+		| Some c ->
+			c
+		| None ->
+			let file = try Common.find_file com file with
+				| Not_found -> try Common.find_file com (file ^ ".dll") with
+				| Not_found ->
+					failwith (".NET lib " ^ file ^ " not found")
+			in
+			real_file := file;
+			let r = PeReader.create_r (open_in file) com.defines in
+			let ctx = PeReader.read r in
+			let clr_header = PeReader.read_clr_header ctx in
+			let meta = IlMetaReader.read_meta_tables ctx clr_header in
+			close_in (r.PeReader.ch);
+			Hashtbl.iter (fun _ td ->
+				let path = IlMetaTools.get_path (TypeDef td) in
+				Hashtbl.add com.net_path_map (netpath_to_hx path) path;
+				Hashtbl.replace meta.il_typedefs path td
+			) meta.il_typedefs;
+			let meta = { nstd = std; ncom = com; nil = meta } in
+			ilctx := Some meta;
+			meta
+	in
+	let lookup path =
+		try
+			let ctx = get_ctx() in
+			let ns, n, cl = hxpath_to_net ctx path in
+			let cls = IlMetaTools.convert_class ctx.nil (ns,n,cl) in
+			Some cls
+		with | Not_found ->
+			None
+	in
+
+	let all_files () =
+		Hashtbl.fold (fun path _ acc -> match path with
+			| _,_ :: _, _ -> acc
+			| _ -> netpath_to_hx path :: acc) (get_ctx()).nil.il_typedefs []
+	in
+
+	let build path =
+		let p = { pfile = !real_file; pmin = 0; pmax = 0; } in
+		let pack = match fst path with | ["haxe";"root"] -> [] | p -> p in
+		let cp = ref [] in
+		let rec build path = try
+			match lookup path with
+			| Some cls ->
+				let ctx = get_ctx() in
+				let hxcls = convert_ilclass ctx p cls in
+				cp := (hxcls,p) :: !cp;
+				List.iter (fun ilpath ->
+					let path = netpath_to_hx ilpath in
+					build path
+				) cls.cnested
+			| _ -> ()
+		with | Not_found | Exit ->
+			()
+		in
+		build path;
+		match !cp with
+			| [] -> None
+			| cp -> Some (!real_file, (pack,cp))
+	in
+	let build path p =
+		build path
+	in
+  com.load_extern_type <- com.load_extern_type @ [build];
+  com.net_libs <- (file, std, all_files, lookup) :: com.net_libs
+

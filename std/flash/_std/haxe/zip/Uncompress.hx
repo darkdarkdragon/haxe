@@ -19,41 +19,30 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
  */
-@:coreApi class StringBuf {
+package haxe.zip;
 
-	private var b : Dynamic;
+@:coreApi
+class Uncompress {
 
-	public var length(get,never) : Int;
-
-	public function new() : Void {
-		b = __make();
+	public function new( ?windowBits : Int ) : Void {
+		throw "Not implemented for this platform";
 	}
 
-	function get_length() : Int {
-		return __get_length == null ? untyped __dollar__ssize( __to_string(b) ) : __get_length(b);
+	public function execute( src : haxe.io.Bytes, srcPos : Int, dst : haxe.io.Bytes, dstPos : Int ) : { done : Bool, read : Int, write : Int } {
+		return null;
 	}
 
-	public inline function add( x : Dynamic ) : Void {
-		__add(b,x);
+	public function setFlushMode( f : FlushMode ) : Void {
 	}
 
-	public inline function addSub( s : String, pos : Int, ?len : Int ) : Void {
-		__add_sub(b,untyped s.__s,pos,len == null ? s.length - pos : len);
+	public function close() : Void {
 	}
 
-	public inline function addChar( c : Int ) : Void untyped {
-		__add_char(b,c);
+	public static function run( src : haxe.io.Bytes, ?bufsize : Int ) : haxe.io.Bytes {
+		var tmp = new flash.utils.ByteArray();
+		tmp.writeBytes(src.getData(),0,src.length);
+		tmp.uncompress();
+		return haxe.io.Bytes.ofData(tmp);
 	}
-
-	public inline function toString() : String {
-		return new String(__to_string(b));
-	}
-
-	static var __make : Dynamic = neko.Lib.load("std","buffer_new",0);
-	static var __add : Dynamic = neko.Lib.load("std","buffer_add",2);
-	static var __add_char : Dynamic = neko.Lib.load("std","buffer_add_char",2);
-	static var __add_sub : Dynamic = neko.Lib.load("std","buffer_add_sub",4);
-	static var __to_string : Dynamic = neko.Lib.load("std","buffer_string",1);
-	static var __get_length : Dynamic = try neko.Lib.load("std","buffer_get_length",1) catch( e : Dynamic ) null;
 
 }

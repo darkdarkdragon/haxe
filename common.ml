@@ -101,12 +101,19 @@ type platform_config = {
 	pf_ignore_unsafe_cast : bool;
 }
 
+type display_mode =
+	| DMNone
+	| DMDefault
+	| DMUsage
+	| DMMetadata
+	| DMPosition
+
 type context = {
 	(* config *)
 	version : int;
 	args : string list;
 	mutable sys_args : string list;
-	mutable display : bool;
+	mutable display : display_mode;
 	mutable debug : bool;
 	mutable verbose : bool;
 	mutable foptimize : bool;
@@ -138,7 +145,9 @@ type context = {
 	mutable php_lib : string option;
 	mutable php_prefix : string option;
 	mutable swf_libs : (string * (unit -> Swf.swf) * (unit -> ((string list * string),As3hl.hl_class) Hashtbl.t)) list;
-	mutable java_libs : (string * bool * (unit -> unit) * (unit -> ((string list * string) list)) * ((string list * string) -> ((JData.jclass * string * string) option))) list;
+	mutable java_libs : (string * bool * (unit -> unit) * (unit -> (path list)) * (path -> ((JData.jclass * string * string) option))) list; (* (path,std,close,all_files,lookup) *)
+	mutable net_libs : (string * bool * (unit -> path list) * (path -> IlData.ilclass option)) list; (* (path,std,all_files,lookup) *)
+	net_path_map : (path,string list * string list * string) Hashtbl.t;
 	mutable js_gen : (unit -> unit) option;
 	(* typing *)
 	mutable basic : basic_types;
@@ -146,7 +155,7 @@ type context = {
 
 exception Abort of string * Ast.pos
 
-let display_default = ref false
+let display_default = ref DMNone
 
 module Define = struct
 
@@ -161,7 +170,6 @@ module Define = struct
 		| DceDebug
 		| Debug
 		| Display
-		| DisplayMode
 		| DllExport
 		| DllImport
 		| DocGen
@@ -225,7 +233,6 @@ module Define = struct
 		| DceDebug -> ("dce_debug","Show DCE log")
 		| Debug -> ("debug","Activated when compiling with -debug")
 		| Display -> ("display","Activated during completion")
-		| DisplayMode -> ("display_mode", "The display mode to use (default, position, metadata, usage)")
 		| DllExport -> ("dll_export", "GenCPP experimental linking")
 		| DllImport -> ("dll_import", "GenCPP experimental linking")
 		| DocGen -> ("doc_gen","Do not perform any removal/change in order to correctly generate documentation")
@@ -319,6 +326,7 @@ module MetaInfo = struct
 		| CoreType -> ":coreType",("Identifies an abstract as core type so that it requires no implementation",[UsedOn TAbstract])
 		| CppFileCode -> ":cppFileCode",("",[Platform Cpp])
 		| CppNamespaceCode -> ":cppNamespaceCode",("",[Platform Cpp])
+		| CsNative -> ":csNative",("Automatically added by -net-lib on classes generated from .NET DLL files",[Platform Cs; UsedOnEither[TClass;TEnum]; Internal])
 		| Dce -> ":dce",("Forces dead code elimination even when not -dce full is specified",[UsedOnEither [TClass;TEnum]])
 		| Debug -> ":debug",("Forces debug information to be generated into the Swf even without -debug",[UsedOnEither [TClass;TClassField]; Platform Flash])
 		| Decl -> ":decl",("",[Platform Cpp])
@@ -630,7 +638,7 @@ let create v args =
 		std_path = [];
 		class_path = [];
 		main_class = None;
-		defines = PMap.add "true" "1" (if !display_default then PMap.add "display" "1" PMap.empty else PMap.empty);
+		defines = PMap.add "true" "1" (if !display_default <> DMNone then PMap.add "display" "1" PMap.empty else PMap.empty);
 		package_rules = PMap.empty;
 		file = "";
 		types = [];
@@ -643,6 +651,8 @@ let create v args =
 		php_lib = None;
 		swf_libs = [];
 		java_libs = [];
+		net_libs = [];
+		net_path_map = Hashtbl.create 0;
 		neko_libs = [];
 		php_prefix = None;
 		js_gen = None;

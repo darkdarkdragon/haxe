@@ -146,11 +146,18 @@ let make_module ctx mpath file tdecls loadp =
 							if List.mem AInline f.cff_access then error "MultiType constructors cannot be inline" f.cff_pos;
 							if fu.f_expr <> None then error "MultiType constructors cannot have a body" f.cff_pos;
 						end;
+						let has_call e =
+							let rec loop e = match fst e with
+								| ECall _ -> raise Exit
+								| _ -> Ast.map_expr loop e
+							in
+							try ignore(loop e); false with Exit -> true
+						in
 						let fu = {
 							fu with
 							f_expr = (match fu.f_expr with
 							| None -> if Meta.has Meta.MultiType a.a_meta then Some (EConst (Ident "null"),p) else None
-							| Some (EBlock [EBinop (OpAssign,(EConst (Ident "this"),_),e),_],_ | EBinop (OpAssign,(EConst (Ident "this"),_),e),_) ->
+							| Some (EBlock [EBinop (OpAssign,(EConst (Ident "this"),_),e),_],_ | EBinop (OpAssign,(EConst (Ident "this"),_),e),_) when not (has_call e) ->
 								Some (EReturn (Some e), pos e)
 							| Some (EBlock el,p) -> Some (EBlock (init p :: el @ [ret p]),p)
 							| Some e -> Some (EBlock [init p;e;ret p],p)
@@ -1136,7 +1143,7 @@ let type_function ctx args ret fmode f do_display p =
 				| _ -> display_error ctx "Parameter default value should be constant" p; None
 		) in
 		let v,c = add_local ctx n t, c in
-		if n = "this" then v.v_extra <- None,true;
+		if n = "this" then v.v_meta <- (Meta.This,[],p) :: v.v_meta;
 		v,c
 	) args in
 	let old_ret = ctx.ret in
@@ -1408,7 +1415,7 @@ let init_class ctx c p context_init herits fields =
 		c.cl_extern <- true;
 		List.filter (fun f -> List.mem AStatic f.cff_access) fields, []
 	end else fields, herits in
-	if core_api && not ctx.com.display then delay ctx PForce (fun() -> init_core_api ctx c);
+	if core_api && ctx.com.display = DMNone then delay ctx PForce (fun() -> init_core_api ctx c);
 	let rec extends_public c =
 		Meta.has Meta.PublicFields c.cl_meta ||
 		match c.cl_super with
@@ -1456,7 +1463,7 @@ let init_class ctx c p context_init herits fields =
 
 	(* ----------------------- COMPLETION ----------------------------- *)
 
-	let display_file = if ctx.com.display then Common.unique_full_path p.pfile = (!Parser.resume_display).pfile else false in
+	let display_file = if ctx.com.display <> DMNone then Common.unique_full_path p.pfile = (!Parser.resume_display).pfile else false in
 
 	let cp = !Parser.resume_display in
 
@@ -1469,7 +1476,7 @@ let init_class ctx c p context_init herits fields =
 		| TAbstract _ | TInst _ | TEnum _ | TLazy _ | TDynamic _ | TAnon _ | TType _ -> true
 	in
 	let bind_type ctx cf r p macro =
-		if ctx.com.display then begin
+		if ctx.com.display <> DMNone then begin
 			let cp = !Parser.resume_display in
 			if display_file && (cp.pmin = 0 || (p.pmin <= cp.pmin && p.pmax >= cp.pmax)) then begin
 				if macro && not ctx.in_macro then
@@ -1531,8 +1538,19 @@ let init_class ctx c p context_init herits fields =
 						(* disallow initialization of non-physical fields (issue #1958) *)
 						display_error ctx "This field cannot be initialized because it is not a real variable" p; e
 					| Var v when not stat || (v.v_read = AccInline) ->
-						let e = match Optimizer.make_constant_expression ctx e with Some e -> check_cast e | None -> display_error ctx "Variable initialization must be a constant value" p; e in
-						e
+						let e = match Optimizer.make_constant_expression ctx e with
+							| Some e -> e
+							| None ->
+								let rec has_this e = match e.eexpr with
+									| TConst TThis ->
+										display_error ctx "Cannot access this or other member field in variable initialization" e.epos;
+									| _ ->
+									Type.iter has_this e
+								in
+								has_this e;
+								e
+						in
+						check_cast e
 					| _ ->
 						e
 					) in
@@ -1550,7 +1568,7 @@ let init_class ctx c p context_init herits fields =
 	let loop_cf f =
 		let name = f.cff_name in
 		let p = f.cff_pos in
-		if name.[0] = '$' && not ctx.com.display then error "Field names starting with a dollar are not allowed" p;
+		if name.[0] = '$' && ctx.com.display = DMNone then error "Field names starting with a dollar are not allowed" p;
 		let stat = List.mem AStatic f.cff_access in
 		let extern = Meta.has Meta.Extern f.cff_meta || c.cl_extern in
 		let is_abstract,allow_inline =
@@ -1633,10 +1651,16 @@ let init_class ctx c p context_init herits fields =
 				c.cl_extern <- false;
 				if ctx.in_macro then
 					let texpr = CTPath { tpackage = ["haxe";"macro"]; tname = "Expr"; tparams = []; tsub = None } in
+					(* ExprOf type parameter might contain platform-specific type, let's replace it by Expr *)
+					let no_expr_of = function
+						| CTPath { tpackage = ["haxe";"macro"]; tname = "Expr"; tsub = Some ("ExprOf"); tparams = [TPType _] }
+						| CTPath { tpackage = []; tname = ("ExprOf"); tsub = None; tparams = [TPType _] } -> Some texpr
+						| t -> Some t
+					in
 					{
 						f_params = fd.f_params;
 						f_type = (match fd.f_type with None -> Some texpr | t -> t);
-						f_args = List.map (fun (a,o,t,e) -> a,o,(match t with None -> Some texpr | _ -> t),e) fd.f_args;
+						f_args = List.map (fun (a,o,t,e) -> a,o,(match t with None -> Some texpr | Some t -> no_expr_of t),e) fd.f_args;
 						f_expr = fd.f_expr;
 					}
 				else
@@ -1801,7 +1825,7 @@ let init_class ctx c p context_init herits fields =
 				| _ -> tfun [] ret, tfun [ret] ret
 			in
 			let check_method m t req_name =
-				if ctx.com.display then () else
+				if ctx.com.display <> DMNone then () else
 				try
 					let _, t2, f = (if stat then let f = PMap.find m c.cl_statics in Some c, f.cf_type, f else class_field c m) in
 					(* accessors must be public on As3 (issue #1872) *)
@@ -2385,6 +2409,12 @@ let resolve_module_file com m remap p =
 		if (try (Unix.stat file).Unix.st_size with _ -> 0) > 0 then file else raise Not_found
 	| _ -> file
 	) in
+	(* if we try to load a std.xxxx class and resolve a real std file, the package name is not valid, ignore *)
+	(match fst m with
+	| "std" :: _ ->
+		let file = Common.unique_full_path file in
+		if List.exists (fun path -> ExtString.String.starts_with file (try Common.unique_full_path path with _ -> path)) com.std_path then raise Not_found;
+	| _ -> ());
 	if !forbid then begin
 		let _, decls = (!parse_hook) com file p in
 		let meta = (match decls with
