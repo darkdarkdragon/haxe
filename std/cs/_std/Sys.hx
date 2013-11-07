@@ -66,23 +66,33 @@ class Sys {
 	{
 		if (_args == null)
 		{
+          #if windowsphone
+            _args = [];
+          #else
 			var ret = cs.Lib.array(Environment.GetCommandLineArgs());
 			ret.shift();
 			_args = ret;
+          #end  
 		}
 		return _args.copy();
 	}
 
 	public static function getEnv( s : String ) : String
 	{
+        #if windowsphone
+        return "";
+        #else
 		return Environment.GetEnvironmentVariable(s);
+        #end
 	}
 
 	public static function putEnv( s : String, v : String ) : Void
 	{
+        #if !windowsphone
 		Environment.SetEnvironmentVariable(s, v);
 		if (_env != null)
 			_env.set(s, v);
+        #end
 	}
 
 	public static function environment() : haxe.ds.StringMap<String>
@@ -90,11 +100,13 @@ class Sys {
 		if (_env == null)
 		{
 			var e = _env = new haxe.ds.StringMap();
+            #if !windowsphone
 			var nenv = Environment.GetEnvironmentVariables().GetEnumerator();
 			while (nenv.MoveNext())
 			{
 				e.set(nenv.Key, nenv.Value);
 			}
+            #end
 		}
 
 		return _env;
@@ -148,7 +160,9 @@ class Sys {
 
 	public static function exit( code : Int ) : Void
 	{
+        #if !windowsphone
 		Environment.Exit(code);
+        #end
 	}
 
 	public static function time() : Float
@@ -178,7 +192,7 @@ class Sys {
 
 	public static function stdin() : haxe.io.Input
 	{
-#if !(Xbox || CF || MF)
+#if !(Xbox || CF || MF || windowsphone)
 		return new cs.io.NativeInput(cs.system.Console.OpenStandardInput());
 #else
 		return null;
@@ -187,7 +201,7 @@ class Sys {
 
 	public static function stdout() : haxe.io.Output
 	{
-#if !(Xbox || CF || MF)
+#if !(Xbox || CF || MF || windowsphone)
 		return new cs.io.NativeOutput(cs.system.Console.OpenStandardOutput());
 #else
 		return null;
@@ -196,7 +210,7 @@ class Sys {
 
 	public static function stderr() : haxe.io.Output
 	{
-#if !(Xbox || CF || MF)
+#if !(Xbox || CF || MF || windowsphone)
 		return new cs.io.NativeOutput(cs.system.Console.OpenStandardError());
 #else
 		return null;

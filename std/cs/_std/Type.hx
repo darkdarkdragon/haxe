@@ -271,7 +271,11 @@ import cs.internal.Runtime;
 	public static function getEnumConstructs( e : Enum<Dynamic> ) : Array<String> {
 		if (Reflect.hasField(e, "constructs"))
 			return untyped e.constructs.copy();
+        #if !windowsphone
 		return untyped __cs__("new Array<object>(System.Enum.GetNames(e))");
+        #else
+        return untyped __cs__("new Array<object>()");
+        #end
 	}
 
 	@:functionCode('
