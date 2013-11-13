@@ -1007,7 +1007,13 @@ let rec using_field ctx mode e i p =
 			loop l
 	in
 	try loop ctx.m.module_using with Not_found ->
-	try loop ctx.g.global_using with Not_found ->
+	try
+		let acc = loop ctx.g.global_using in
+		(match acc with
+		| AKUsing (_,c,_,_) -> add_dependency ctx.m.curmod c.cl_module
+		| _ -> assert false);
+		acc
+	with Not_found ->
 	if not !check_constant_struct then raise Not_found;
 	remove_constant_flag e.etype (fun ok -> if ok then using_field ctx mode e i p else raise Not_found)
 
@@ -1902,7 +1908,7 @@ and type_unop ctx op flag e p =
 				(match cf.cf_expr with
 				| None ->
 					let e = make {e with etype = apply_params a.a_types pl a.a_this} in
-					unify ctx r e.etype p;
+					(* unify ctx r e.etype p; *) (* TODO: I'm not sure why this was here (related to #2295) *)
 					{e with etype = r}
 				| Some _ ->
 					let et = type_module_type ctx (TClassDecl c) None p in
@@ -2002,7 +2008,9 @@ and type_ident ctx i p mode =
 				AKExpr (mk (TConst TThis) ctx.tthis p)
 			else
 				let t = mk_mono() in
-				AKExpr (mk (TLocal (alloc_var i t)) t p)
+				let v = alloc_var i t in
+				v.v_meta <- [Meta.Unbound,[],p];
+				AKExpr (mk (TLocal v) t p)
 		end else begin
 			if ctx.curfun = FunStatic && PMap.mem i ctx.curclass.cl_fields then error ("Cannot access " ^ i ^ " in static function") p;
 			let err = Unknown_ident i in
@@ -2886,11 +2894,11 @@ and type_expr ctx (e,p) (with_type:with_type) =
 		| Some v ->
 			if params <> [] || inline then v.v_extra <- Some (params,if inline then Some e else None);
 			let rec loop = function
-				| Codegen.Block f | Codegen.Loop f | Codegen.Function f -> f loop
-				| Codegen.Use v2 when v == v2 -> raise Exit
-				| Codegen.Use _ | Codegen.Declare _ -> ()
+				| Filters.Block f | Filters.Loop f | Filters.Function f -> f loop
+				| Filters.Use v2 when v == v2 -> raise Exit
+				| Filters.Use _ | Filters.Declare _ -> ()
 			in
-			let is_rec = (try Codegen.local_usage loop e; false with Exit -> true) in
+			let is_rec = (try Filters.local_usage loop e; false with Exit -> true) in
 			let decl = (if is_rec then begin
 				if inline then display_error ctx "Inline function cannot be recursive" e.epos;
 				let vnew = add_local ctx v.v_name ft in
@@ -3834,9 +3842,9 @@ and flush_macro_context mint ctx =
 		mint
 	end else mint in
 	(* we should maybe ensure that all filters in Main are applied. Not urgent atm *)
-	(try Interp.add_types mint types (Codegen.post_process mctx [Codegen.Abstract.handle_abstract_casts mctx; Codegen.captured_vars mctx.com; Codegen.rename_local_vars mctx.com])
+	(try Interp.add_types mint types (Filters.post_process mctx [Codegen.Abstract.handle_abstract_casts mctx; Filters.captured_vars mctx.com; Filters.rename_local_vars mctx.com])
 	with Error (e,p) -> raise (Fatal_error(error_msg e,p)));
-	Codegen.post_process_end()
+	Filters.post_process_end()
 
 let create_macro_interp ctx mctx =
 	let com2 = mctx.com in

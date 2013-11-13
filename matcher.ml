@@ -827,7 +827,7 @@ let get_cache mctx dt =
 		DynArray.add mctx.dt_lut dt;
 		dt
 
-let rec compile mctx stl pmat =
+let rec compile mctx stl pmat toplevel =
 	let guard e dt1 dt2 = get_cache mctx (Guard(e,dt1,dt2)) in
 	let expr e = get_cache mctx (Expr e) in
 	let bind bl dt = get_cache mctx (Bind(bl,dt)) in
@@ -848,7 +848,7 @@ let rec compile mctx stl pmat =
 		| _ ->
 			assert false)
 	| ([|{p_def = PTuple pt}|],out) :: pl ->
-		compile mctx stl ((pt,out) :: pl)
+		compile mctx stl ((pt,out) :: pl) toplevel
 	| (pv,out) :: pl ->
 		let i = pick_column pmat in
 		if i = -1 then begin
@@ -856,13 +856,13 @@ let rec compile mctx stl pmat =
 			let bl = bind_remaining out pv stl in
 			let dt = match out.o_guard with
 				| None -> expr out.o_expr
-				| Some e -> guard e (expr out.o_expr) (match pl with [] -> None | _ -> Some (compile mctx stl pl))
+				| Some e -> guard e (expr out.o_expr) (match pl with [] -> None | _ -> Some (compile mctx stl pl false))
 			in
 			(if bl = [] then dt else bind bl dt)
 		end else if i > 0 then begin
 			let pmat = swap_pmat_columns i pmat in
 			let stls = swap_columns i stl in
-			compile mctx stls pmat
+			compile mctx stls pmat toplevel
 		end else begin
 			let st_head,st_tail = match stl with st :: stl -> st,stl | _ -> assert false in
 			let sigma,bl = column_sigma mctx st_head pmat in
@@ -872,7 +872,7 @@ let rec compile mctx stl pmat =
 				let spec = spec mctx c pmat in
 				let hsubs = mk_subs st_head c in
 				let subs = hsubs @ st_tail in
-				let dt = compile mctx subs spec in
+				let dt = compile mctx subs spec false in
 				c,dt
 			) sigma in
 			let def = default mctx pmat in
@@ -881,7 +881,7 @@ let rec compile mctx stl pmat =
 				switch st_head cases
 			| _ when not inf && PMap.is_empty !all ->
 				switch st_head cases
-			| [],_ when inf && not mctx.need_val ->
+			| [],_ when inf && not mctx.need_val && toplevel ->
 				switch st_head cases
 			| [],_ when inf ->
 				raise (Not_exhaustive(any,st_head))
@@ -889,10 +889,10 @@ let rec compile mctx stl pmat =
 				let pl = PMap.foldi (fun cd p acc -> (mk_con_pat cd [] t_dynamic p) :: acc) !all [] in
 				raise (Not_exhaustive(collapse_pattern pl,st_head))
 			| def,[] ->
-				compile mctx st_tail def
+				compile mctx st_tail def false
 			| def,_ ->
 				let cdef = mk_con CAny t_dynamic st_head.st_pos in
-				let cases = cases @ [cdef,compile mctx st_tail def] in
+				let cases = cases @ [cdef,compile mctx st_tail def false] in
 				switch st_head cases
 			in
 			if bl = [] then dt else bind bl dt
@@ -1053,13 +1053,14 @@ let match_expr ctx e cases def with_type p =
 	(* type subject(s) *)
 	let array_match = ref false in
 	let evals = match fst e with
-		| EArrayDecl el | EParenthesis(EArrayDecl el,_) ->
+		| EArrayDecl el | EParenthesis(EArrayDecl el,_) when (match el with [(EFor _ | EWhile _),_] -> false | _ -> true) ->
 			array_match := true;
 			List.map (fun e -> type_expr ctx e Value) el
 		| _ ->
 			let e = type_expr ctx e Value in
 			begin match follow e.etype with
-			| TEnum(en,_) when PMap.is_empty en.e_constrs || Meta.has Meta.FakeEnum en.e_meta ->
+			(* TODO: get rid of the XmlType check *)
+			| TEnum(en,_) when (en.e_path = ([],"XmlType")) || Meta.has Meta.FakeEnum en.e_meta ->
 				raise Exit
 			| TAbstract({a_path=[],("Int" | "Float" | "Bool")},_) | TInst({cl_path = [],"String"},_) when (Common.defined ctx.com Common.Define.NoPatternMatching) ->
 				raise Exit;
@@ -1069,6 +1070,7 @@ let match_expr ctx e cases def with_type p =
 			[e]
 	in
 	let var_inits = ref [] in
+	let save = save_locals ctx in
 	let a = List.length evals in
 	(* turn subjects to subterms and handle variable initialization where necessary *)
 	let stl = ExtList.List.mapi (fun i e ->
@@ -1080,6 +1082,7 @@ let match_expr ctx e cases def with_type p =
 			| _ ->
 				let v = gen_local ctx e.etype in
 				var_inits := (v, Some e) :: !var_inits;
+				ctx.locals <- PMap.add v.v_name v ctx.locals;
 				mk_st (SVar v) e.etype e.epos
 		in
 		let st = loop e in
@@ -1208,7 +1211,7 @@ let match_expr ctx e cases def with_type p =
 	in
 	let dt = try
 		(* compile decision tree *)
-		compile mctx stl pl
+		compile mctx stl pl true
 	with Not_exhaustive(pat,st) ->
  		let rec s_st_r top pre st v = match st.st_def with
  			| SVar v1 ->
@@ -1255,6 +1258,7 @@ let match_expr ctx e cases def with_type p =
 		in
 		error ("Unmatched patterns: " ^ (s_st_r true false st pat)) st.st_pos
 	in
+	save();
 	(* check for unused patterns *)
 	if !extractor_depth = 0 then check_unused();
 	if mctx.has_extractor then decr extractor_depth;

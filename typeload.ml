@@ -567,6 +567,7 @@ and init_meta_overloads ctx cf =
 let hide_types ctx =
 	let old_m = ctx.m in
 	let old_type_params = ctx.type_params in
+	let old_deps = ctx.g.std.m_extra.m_deps in
 	ctx.m <- {
 		curmod = ctx.g.std;
 		module_types = [];
@@ -578,6 +579,8 @@ let hide_types ctx =
 	(fun() ->
 		ctx.m <- old_m;
 		ctx.type_params <- old_type_params;
+		(* restore dependencies that might be have been wronly inserted *)
+		ctx.g.std.m_extra.m_deps <- old_deps;
 	)
 
 (*
@@ -587,6 +590,12 @@ let load_core_type ctx name =
 	let show = hide_types ctx in
 	let t = load_instance ctx { tpackage = []; tname = name; tparams = []; tsub = None; } null_pos false in
 	show();
+	add_dependency ctx.m.curmod (match t with
+	| TInst (c,_) -> c.cl_module
+	| TType (t,_) -> t.t_module
+	| TAbstract (a,_) -> a.a_module
+	| TEnum (e,_) -> e.e_module
+	| _ -> assert false);
 	t
 
 let t_iterator ctx =
@@ -594,6 +603,7 @@ let t_iterator ctx =
 	match load_type_def ctx null_pos { tpackage = []; tname = "Iterator"; tparams = []; tsub = None } with
 	| TTypeDecl t ->
 		show();
+		add_dependency ctx.m.curmod t.t_module;
 		if List.length t.t_types <> 1 then assert false;
 		let pt = mk_mono() in
 		apply_params t.t_types [pt] t.t_type, pt
@@ -1432,7 +1442,7 @@ let init_class ctx c p context_init herits fields =
 			true
 		else match parent with
 			| Some { cf_public = p } -> p
-			| _ -> c.cl_extern || c.cl_interface || extends_public || (match c.cl_kind with KAbstractImpl _ -> true | _ -> false)
+			| _ -> c.cl_extern || c.cl_interface || extends_public || (ctx.com.version < 30200 && match c.cl_kind with KAbstractImpl _ -> true | _ -> false)
 	in
 	let rec get_parent c name =
 		match c.cl_super with
@@ -1649,9 +1659,9 @@ let init_class ctx c p context_init herits fields =
 			let fd = if not is_macro then
 				fd
 			else begin
-				(* a class with a macro cannot be extern in macro context (issue #2015) *)
-				c.cl_extern <- false;
-				if ctx.in_macro then
+				if ctx.in_macro then begin
+					(* a class with a macro cannot be extern in macro context (issue #2015) *)
+					c.cl_extern <- false;
 					let texpr = CTPath { tpackage = ["haxe";"macro"]; tname = "Expr"; tparams = []; tsub = None } in
 					(* ExprOf type parameter might contain platform-specific type, let's replace it by Expr *)
 					let no_expr_of = function
@@ -1665,7 +1675,7 @@ let init_class ctx c p context_init herits fields =
 						f_args = List.map (fun (a,o,t,e) -> a,o,(match t with None -> Some texpr | Some t -> no_expr_of t),e) fd.f_args;
 						f_expr = fd.f_expr;
 					}
-				else
+				end else
 					let tdyn = Some (CTPath { tpackage = []; tname = "Dynamic"; tparams = []; tsub = None }) in
 					let to_dyn = function
 						| { tpackage = ["haxe";"macro"]; tname = "Expr"; tsub = Some ("ExprOf"); tparams = [TPType t] } -> Some t
@@ -1715,7 +1725,7 @@ let init_class ctx c p context_init herits fields =
 				cf_params = params;
 				cf_overloads = [];
 			} in
-			let do_bind = ref (not (cf.cf_name <> "__init__" && (c.cl_extern && not inline) || c.cl_interface)) in
+			let do_bind = ref (((not c.cl_extern || inline) && not c.cl_interface) || cf.cf_name = "__init__") in
 			(match c.cl_kind with
 				| KAbstractImpl a ->
 					let m = mk_mono() in
@@ -2364,6 +2374,11 @@ let type_module ctx m file tdecls p =
 		opened = [];
 		vthis = None;
 	} in
+	if ctx.g.std != null_module then begin
+		add_dependency m ctx.g.std;
+		(* this will ensure both String and (indirectly) Array which are basic types which might be referenced *)
+		ignore(load_core_type ctx "String");
+	end;
 	(* here is an additional PASS 1 phase, which define the type parameters for all module types.
 		 Constraints are handled lazily (no other type is loaded) because they might be recursive anyway *)
 	List.iter (fun d ->

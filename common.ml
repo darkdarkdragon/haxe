@@ -152,6 +152,7 @@ type context = {
 	mutable js_gen : (unit -> unit) option;
 	(* typing *)
 	mutable basic : basic_types;
+	memory_marker : float array;
 }
 
 exception Abort of string * Ast.pos
@@ -208,6 +209,7 @@ module Define = struct
 		| RealPosition
 		| ReplaceFiles
 		| Scriptable
+		| ShallowExpose
 		| Swc
 		| SwfCompressLevel
 		| SwfDebugPassword
@@ -275,6 +277,7 @@ module Define = struct
 		| RealPosition -> ("real_position","Disables haxe source mapping when targetting C#")
 		| ReplaceFiles -> ("replace_files","GenCommon internal")
 		| Scriptable -> ("scriptable","GenCPP internal")
+		| ShallowExpose -> ("shallow-expose","Expose types to surrounding scope of Haxe generated closure without writing to window object")
 		| Swc -> ("swc","Output a SWC instead of a SWF")
 		| SwfCompressLevel -> ("swf_compress_level","<level:1-9> Set the amount of compression for the SWF output")
 		| SwfDebugPassword -> ("swf_debug_password", "Set a password for debugging.")
@@ -416,6 +419,7 @@ module MetaInfo = struct
 		| Transient -> ":transient",("Adds the 'transient' flag to the class field",[Platform Java; UsedOn TClassField])
 		| ValueUsed -> ":valueUsed",("Internally used by DCE to mark an abstract value as used",[Internal])
 		| Volatile -> ":volatile",("",[Platforms [Java;Cs]])
+		| Unbound -> ":unbound", ("Compiler internal to denote unbounded global variable",[])
 		| UnifyMinDynamic -> ":unifyMinDynamic",("Allows a collection of types to unify to Dynamic",[UsedOn TClassField])
 		| Unreflective -> ":unreflective",("",[Platform Cpp])
 		| Unsafe -> ":unsafe",("Declares a class, or a method with the C#'s 'unsafe' flag",[Platform Cs; UsedOnEither [TClass;TClassField]])
@@ -627,6 +631,8 @@ let get_config com =
 			pf_ignore_unsafe_cast = false;
 		}
 
+let memory_marker = [|Unix.time()|]
+
 let create v args =
 	let m = Type.mk_mono() in
 	{
@@ -678,6 +684,7 @@ let create v args =
 			tstring = m;
 			tarray = (fun _ -> assert false);
 		};
+		memory_marker = memory_marker;
 	}
 
 let log com str =
@@ -846,6 +853,9 @@ let normalize_path p =
 		| '\\' | '/' -> p
 		| _ -> p ^ "/"
 
+let mem_size v =
+	Objsize.size_with_headers (Objsize.objsize v [] [])
+		
 (* ------------------------- TIMERS ----------------------------- *)
 
 type timer_infos = {
