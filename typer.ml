@@ -222,8 +222,10 @@ let class_field ctx c pl name p =
 	raw_class_field (fun f -> field_type ctx c pl f p) c name
 
 (* checks if we can access to a given class field using current context *)
-let rec can_access ctx c cf stat =
+let rec can_access ctx ?(in_overload=false) c cf stat =
 	if cf.cf_public then
+		true
+	else if not in_overload && ctx.com.config.pf_overload && Meta.has Meta.Overload cf.cf_meta then
 		true
 	else
 	(* TODO: should we add a c == ctx.curclass short check here? *)
@@ -502,9 +504,13 @@ let rec unify_call_params ctx ?(overloads=None) cf el args r p inline =
   (* it's used to correctly support an overload selection algorithm *)
 	let overloads, compatible, legacy = match cf, overloads with
 		| Some(TInst(c,pl),f), None when ctx.com.config.pf_overload && Meta.has Meta.Overload f.cf_meta ->
-				let overloads = List.filter (fun (_,f2) -> not (f == f2)) (Typeload.get_overloads c f.cf_name) in
+				let overloads = List.filter (fun (_,f2) ->
+					not (f == f2) && (f2.cf_public || can_access ctx ~in_overload:true c f2 false)
+				) (Typeload.get_overloads c f.cf_name) in
 				if overloads = [] then (* is static function *)
-					List.map (fun f -> f.cf_type, f) f.cf_overloads, [], false
+					let overloads = List.map (fun f -> f.cf_type, f) f.cf_overloads in
+					let is_static = f.cf_name <> "new" in
+					List.filter (fun (_,f) -> can_access ctx ~in_overload:true c f is_static) overloads, [], false
 				else
 					overloads, [], false
 		| Some(_,f), None ->
@@ -647,37 +653,7 @@ let rec type_module_type ctx t tparams p =
 		mk (TTypeExpr (TClassDecl c)) (TType (t_tmp,[])) p
 	| TEnumDecl e ->
 		let types = (match tparams with None -> List.map (fun _ -> mk_mono()) e.e_types | Some l -> l) in
-		let fl = PMap.fold (fun f acc ->
-			PMap.add f.ef_name {
-				cf_name = f.ef_name;
-				cf_public = true;
-				cf_type = f.ef_type;
-				cf_kind = (match follow f.ef_type with
-					| TFun _ -> Method MethNormal
-					| _ -> Var { v_read = AccNormal; v_write = AccNo }
-				);
-				cf_pos = e.e_pos;
-				cf_doc = None;
-				cf_meta = no_meta;
-				cf_expr = None;
-				cf_params = f.ef_params;
-				cf_overloads = [];
-			} acc
-		) e.e_constrs PMap.empty in
-		let t_tmp = {
-			t_path = fst e.e_path, "#" ^ snd e.e_path;
-			t_module = e.e_module;
-			t_doc = None;
-			t_pos = e.e_pos;
-			t_type = TAnon {
-				a_fields = fl;
-				a_status = ref (EnumStatics e);
-			};
-			t_private = true;
-			t_types = e.e_types;
-			t_meta = no_meta;
-		} in
-		mk (TTypeExpr (TEnumDecl e)) (TType (t_tmp,types)) p
+		mk (TTypeExpr (TEnumDecl e)) (TType (e.e_type,types)) p
 	| TTypeDecl s ->
 		let t = apply_params s.t_types (List.map (fun _ -> mk_mono()) s.t_types) s.t_type in
 		(match follow t with
@@ -737,17 +713,22 @@ let make_call ctx e params t p =
 			| _ -> false
 		) in
 		let config = match cl with
-			| Some ({cl_kind = KAbstractImpl _ }) when Meta.has Meta.Impl f.cf_meta ->
-				(match if fname = "_new" then
+			| Some ({cl_kind = KAbstractImpl _}) when Meta.has Meta.Impl f.cf_meta ->
+				let t = if fname = "_new" then
 					t
 				else if params = [] then
 					error "Invalid abstract implementation function" f.cf_pos
 				else
-					follow (List.hd params).etype with
+					follow (List.hd params).etype
+				in
+				begin match t with
 					| TAbstract(a,pl) ->
-						Some (a.a_types <> [] || f.cf_params <> [], fun t -> apply_params a.a_types pl (monomorphs f.cf_params t))
+						let has_params = a.a_types <> [] || f.cf_params <> [] in
+						let map_type = fun t -> apply_params a.a_types pl (monomorphs f.cf_params t) in
+						Some (has_params,map_type)
 					| _ ->
-						None);
+						None
+				end
 			| _ ->
 				None
 		in
@@ -1001,7 +982,13 @@ let rec using_field ctx mode e i p =
 			loop l
 	in
 	try loop ctx.m.module_using with Not_found ->
-	try loop ctx.g.global_using with Not_found ->
+	try
+		let acc = loop ctx.g.global_using in
+		(match acc with
+		| AKUsing (_,c,_,_) -> add_dependency ctx.m.curmod c.cl_module
+		| _ -> assert false);
+		acc
+	with Not_found ->
 	if not !check_constant_struct then raise Not_found;
 	remove_constant_flag e.etype (fun ok -> if ok then using_field ctx mode e i p else raise Not_found)
 
@@ -1123,7 +1110,19 @@ and type_field ctx e i p mode =
 			| TInst({cl_kind = KAbstractImpl a},_) -> TAbstract(a,[])
 			| _ -> e.etype
 		in
-		if not ctx.untyped then display_error ctx (string_error i (string_source t) (s_type (print_context()) t ^ " has no field " ^ i)) p;
+		let has_special_field a =
+			List.exists (fun (_,cf) -> cf.cf_name = i) a.a_ops
+			|| List.exists (fun (_,_,cf) -> cf.cf_name = i) a.a_unops
+			|| List.exists (fun cf -> cf.cf_name = i) a.a_array
+		in
+		if not ctx.untyped then begin
+			match t with
+			| TAbstract(a,_) when has_special_field a ->
+				(* the abstract field is not part of the field list, which is only true when it has no expression (issue #2344) *)
+				display_error ctx ("Field " ^ i ^ " cannot be called directly because it has no expression") p;
+			| _ ->
+				display_error ctx (string_error i (string_source t) (s_type (print_context()) t ^ " has no field " ^ i)) p;
+		end;
 		AKExpr (mk (TField (e,FDynamic i)) (mk_mono()) p)
 	in
 	match follow e.etype with
@@ -1514,9 +1513,15 @@ let rec type_binop ctx op e1 e2 is_assign_op p =
 				try find_array_access a pl c ekey.etype e2.etype true
 				with Not_found -> error ("No @:arrayAccess function accepts arguments of " ^ (s_type (print_context()) ekey.etype) ^ " and " ^ (s_type (print_context()) e2.etype)) p
 			in
-			let et = type_module_type ctx (TClassDecl c) None p in
-			let ef = mk (TField(et,(FStatic(c,cf)))) tf p in
-			make_call ctx ef [ebase;ekey;e2] r p
+			begin match cf.cf_expr with
+				| None ->
+					let ea = mk (TArray(ebase,ekey)) r p in
+					mk (TBinop(OpAssign,ea,e2)) r p
+				| Some _ ->
+					let et = type_module_type ctx (TClassDecl c) None p in
+					let ef = mk (TField(et,(FStatic(c,cf)))) tf p in
+					make_call ctx ef [ebase;ekey;e2] r p
+			end
 		| AKUsing(ef,_,_,et) ->
 			(* this must be an abstract setter *)
 			let ret = match follow ef.etype with
@@ -1599,14 +1604,22 @@ let rec type_binop ctx op e1 e2 is_assign_op p =
 				try find_array_access a pl c ekey.etype eget.etype true
 				with Not_found -> error ("No @:arrayAccess function accepts arguments of " ^ (s_type (print_context()) ekey.etype) ^ " and " ^ (s_type (print_context()) eget.etype)) p
 			in
-			let ef_set = mk (TField(et,(FStatic(c,cf_set)))) tf_set p in
-			(match l() with
-			| None -> make_call ctx ef_set [ebase;ekey;eget] r_set p
-			| Some e ->
-				mk (TBlock [
-					e;
-					make_call ctx ef_set [ebase;ekey;eget] r_set p
-				]) r_set p)
+			begin match cf_set.cf_expr,cf_get.cf_expr with
+				| None,None ->
+					let ea = mk (TArray(ebase,ekey)) r_get p in
+					mk (TBinop(OpAssignOp op,ea,type_expr ctx e2 (WithType r_get))) r_set p
+				| Some _,Some _ ->
+					let ef_set = mk (TField(et,(FStatic(c,cf_set)))) tf_set p in
+					(match l() with
+					| None -> make_call ctx ef_set [ebase;ekey;eget] r_set p
+					| Some e ->
+						mk (TBlock [
+							e;
+							make_call ctx ef_set [ebase;ekey;eget] r_set p
+						]) r_set p)
+				| _ ->
+					error "Invalid array access getter/setter combination" p
+			end;
 		| AKInline _ | AKMacro _ ->
 			assert false)
 	| _ ->
@@ -1815,14 +1828,19 @@ let rec type_binop ctx op e1 e2 is_assign_op p =
 		(* obviously a hack to report back that we need an assignment *)
 		if is_assign_op && not assign then mk (TField(ec,FDynamic ":needsAssign")) t_dynamic p else ec
 	in
-	let cast_rec e1t e2t r =
-		let e = make e1t e2t in
-		begin try
-			unify_raise ctx e.etype r p
-		with Error (Unify _,_) ->
-			error ("The result of this operation (" ^ (s_type (print_context()) e.etype) ^ ") is not compatible with declared return type " ^ (s_type (print_context()) r)) p;
-		end;
-		{e with etype = r}
+	let cast_rec e1t e2t r is_core_type =
+		if is_core_type then
+			(* we assume that someone declaring a @:coreType knows what he is doing with regards to operation return types (issue #2333) *)
+			mk (TBinop(op,e1t,e2t)) r p
+		else begin
+			let e = make e1t e2t in
+			begin try
+				unify_raise ctx e.etype r p
+			with Error (Unify _,_) ->
+				error ("The result of this operation (" ^ (s_type (print_context()) e.etype) ^ ") is not compatible with declared return type " ^ (s_type (print_context()) r)) p;
+			end;
+			{e with etype = r}
+		end
 	in
 	try (match follow e1.etype with
 		| TAbstract ({a_impl = Some c} as a,pl) ->
@@ -1830,7 +1848,7 @@ let rec type_binop ctx op e1 e2 is_assign_op p =
 			begin match f.cf_expr with
 				| None ->
 					let e2 = match follow e2.etype with TAbstract(a,pl) -> {e2 with etype = apply_params a.a_types pl a.a_this} | _ -> e2 in
-					cast_rec {e1 with etype = apply_params a.a_types pl a.a_this} e2 r
+					cast_rec {e1 with etype = apply_params a.a_types pl a.a_this} e2 r (Meta.has Meta.CoreType a.a_meta)
 				| Some _ ->
 					mk_cast_op c f a pl e1 e2 r assign
 			end
@@ -1843,7 +1861,7 @@ let rec type_binop ctx op e1 e2 is_assign_op p =
 				| None ->
 					let e1,e2 = if commutative then e2,e1 else e1,e2 in
 					let e1 = match follow e1.etype with TAbstract(a,pl) -> {e1 with etype = apply_params a.a_types pl a.a_this} | _ -> e1 in
-					cast_rec e1 {e2 with etype = apply_params a.a_types pl a.a_this} r
+					cast_rec e1 {e2 with etype = apply_params a.a_types pl a.a_this} r (Meta.has Meta.CoreType a.a_meta)
 				| Some _ ->
 					let e1,e2 = if commutative then e2,e1 else e1,e2 in
 					mk_cast_op c f a pl e1 e2 r assign
@@ -1896,7 +1914,7 @@ and type_unop ctx op flag e p =
 				(match cf.cf_expr with
 				| None ->
 					let e = make {e with etype = apply_params a.a_types pl a.a_this} in
-					unify ctx r e.etype p;
+					(* unify ctx r e.etype p; *) (* TODO: I'm not sure why this was here (related to #2295) *)
 					{e with etype = r}
 				| Some _ ->
 					let et = type_module_type ctx (TClassDecl c) None p in
@@ -1996,7 +2014,9 @@ and type_ident ctx i p mode =
 				AKExpr (mk (TConst TThis) ctx.tthis p)
 			else
 				let t = mk_mono() in
-				AKExpr (mk (TLocal (alloc_var i t)) t p)
+				let v = alloc_var i t in
+				v.v_meta <- [Meta.Unbound,[],p];
+				AKExpr (mk (TLocal v) t p)
 		end else begin
 			if ctx.curfun = FunStatic && PMap.mem i ctx.curclass.cl_fields then error ("Cannot access " ^ i ^ " in static function") p;
 			let err = Unknown_ident i in
@@ -2150,16 +2170,23 @@ and type_access ctx e p mode =
 		let has_abstract_array_access = ref false in
 		(try (match follow e1.etype with
 		| TAbstract ({a_impl = Some c} as a,pl) when a.a_array <> [] ->
-			(match mode with
+			begin match mode with
 			| MSet ->
 				(* resolve later *)
 				AKAccess (e1, e2)
 			| _ ->
 				has_abstract_array_access := true;
 				let cf,tf,r = find_array_access a pl c e2.etype t_dynamic false in
-				let et = type_module_type ctx (TClassDecl c) None p in
-				let ef = mk (TField(et,(FStatic(c,cf)))) tf p in
-				AKExpr (make_call ctx ef [e1;e2] r p))
+				let e = match cf.cf_expr with
+					| None ->
+						mk (TArray(e1,e2)) r p
+					| Some _ ->
+						let et = type_module_type ctx (TClassDecl c) None p in
+						let ef = mk (TField(et,(FStatic(c,cf)))) tf p in
+						make_call ctx ef [e1;e2] r p
+				in
+				AKExpr e
+			end
 		| _ -> raise Not_found)
 		with Not_found ->
 		unify ctx e2.etype ctx.t.tint e2.epos;
@@ -2325,7 +2352,7 @@ and type_expr ctx (e,p) (with_type:with_type) =
 						if ctx.untyped then raise Not_found;
 						with_type_error ctx with_type (string_error s e.e_names ("Identifier '" ^ s ^ "' is not part of enum " ^ s_type_path e.e_path)) p;
 						mk (TConst TNull) t p)
-				| TAbstract (a,pl) when has_meta Meta.FakeEnum a.a_meta ->
+				| TAbstract (a,pl) when has_meta Meta.Enum a.a_meta ->
 					let cimpl = (match a.a_impl with None -> assert false | Some c -> c) in
 					(try
 						let cf = PMap.find s cimpl.cl_statics in
@@ -2585,7 +2612,7 @@ and type_expr ctx (e,p) (with_type:with_type) =
 				| _ ->
 					(try
 						unify_raise ctx e1.etype t e1.epos;
-						e1
+						Codegen.Abstract.check_cast ctx t e1 p
 					with Error (Unify _,_) ->
 						let acc = build_call ctx (type_field ctx e1 "iterator" e1.epos MCall) [] Value e1.epos in
 						try
@@ -2880,11 +2907,11 @@ and type_expr ctx (e,p) (with_type:with_type) =
 		| Some v ->
 			if params <> [] || inline then v.v_extra <- Some (params,if inline then Some e else None);
 			let rec loop = function
-				| Codegen.Block f | Codegen.Loop f | Codegen.Function f -> f loop
-				| Codegen.Use v2 when v == v2 -> raise Exit
-				| Codegen.Use _ | Codegen.Declare _ -> ()
+				| Filters.Block f | Filters.Loop f | Filters.Function f -> f loop
+				| Filters.Use v2 when v == v2 -> raise Exit
+				| Filters.Use _ | Filters.Declare _ -> ()
 			in
-			let is_rec = (try Codegen.local_usage loop e; false with Exit -> true) in
+			let is_rec = (try Filters.local_usage loop e; false with Exit -> true) in
 			let decl = (if is_rec then begin
 				if inline then display_error ctx "Inline function cannot be recursive" e.epos;
 				let vnew = add_local ctx v.v_name ft in
@@ -3048,8 +3075,12 @@ and type_expr ctx (e,p) (with_type:with_type) =
 				(match !(a.a_status) with
 				| Statics c ->
 					if Meta.has Meta.CoreApi c.cl_meta then merge_core_doc c;
+					let is_abstract_impl = match c.cl_kind with KAbstractImpl _ -> true | _ -> false in
 					let pm = match c.cl_constructor with None -> PMap.empty | Some cf -> PMap.add "new" cf PMap.empty in
-					PMap.fold (fun f acc -> if can_access ctx c f true then PMap.add f.cf_name { f with cf_public = true; cf_type = opt_type f.cf_type } acc else acc) a.a_fields pm
+					PMap.fold (fun f acc ->
+						if can_access ctx c f true && (not is_abstract_impl || not (Meta.has Meta.Impl f.cf_meta)) then
+							PMap.add f.cf_name { f with cf_public = true; cf_type = opt_type f.cf_type } acc else acc
+					) a.a_fields pm
 				| _ ->
 					a.a_fields)
 			| TFun (args,ret) ->
@@ -3713,10 +3744,10 @@ let make_macro_api ctx p =
 			match ctx.g.get_build_infos() with
 			| Some (mt,_) ->
 				Some (match mt with
-					| TClassDecl c -> TInst (c,[])
-					| TEnumDecl e -> TEnum (e,[])
-					| TTypeDecl t -> TType (t,[])
-					| TAbstractDecl a -> TAbstract(a,[]))
+					| TClassDecl c -> TInst (c,List.map snd c.cl_types)
+					| TEnumDecl e -> TEnum (e,List.map snd e.e_types)
+					| TTypeDecl t -> TType (t,List.map snd t.t_types)
+					| TAbstractDecl a -> TAbstract(a,List.map snd a.a_types))
 			| None ->
 				if ctx.curclass == null_class then
 					None
@@ -3828,9 +3859,9 @@ and flush_macro_context mint ctx =
 		mint
 	end else mint in
 	(* we should maybe ensure that all filters in Main are applied. Not urgent atm *)
-	(try Interp.add_types mint types (Codegen.post_process mctx [Codegen.Abstract.handle_abstract_casts mctx; Codegen.captured_vars mctx.com; Codegen.rename_local_vars mctx.com])
+	(try Interp.add_types mint types (Filters.post_process mctx [Codegen.Abstract.handle_abstract_casts mctx; Filters.captured_vars mctx.com; Filters.rename_local_vars mctx.com])
 	with Error (e,p) -> raise (Fatal_error(error_msg e,p)));
-	Codegen.post_process_end()
+	Filters.post_process_end()
 
 let create_macro_interp ctx mctx =
 	let com2 = mctx.com in

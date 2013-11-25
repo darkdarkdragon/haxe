@@ -83,8 +83,6 @@ type platform_config = {
 	pf_captured_scope : bool;
 	(** generated locals must be absolutely unique wrt the current function *)
 	pf_unique_locals : bool;
-	(** which expressions can be generated to initialize member variables (or will be moved into the constructor *)
-	pf_can_init_member : tclass_field -> bool;
 	(** captured variables handling (see before) *)
 	pf_capture_policy : capture_policy;
 	(** when calling a method with optional args, do we replace the missing args with "null" constants *)
@@ -147,10 +145,12 @@ type context = {
 	mutable swf_libs : (string * (unit -> Swf.swf) * (unit -> ((string list * string),As3hl.hl_class) Hashtbl.t)) list;
 	mutable java_libs : (string * bool * (unit -> unit) * (unit -> (path list)) * (path -> ((JData.jclass * string * string) option))) list; (* (path,std,close,all_files,lookup) *)
 	mutable net_libs : (string * bool * (unit -> path list) * (path -> IlData.ilclass option)) list; (* (path,std,all_files,lookup) *)
+	mutable net_std : string list;
 	net_path_map : (path,string list * string list * string) Hashtbl.t;
 	mutable js_gen : (unit -> unit) option;
 	(* typing *)
 	mutable basic : basic_types;
+	memory_marker : float array;
 }
 
 exception Abort of string * Ast.pos
@@ -192,6 +192,8 @@ module Define = struct
 		| NekoSource
 		| NekoV1
 		| NetworkSandbox
+		| NetVer
+		| NetTarget
 		| NoCompilation
 		| NoCOpt
 		| NoFlashOverride
@@ -205,6 +207,7 @@ module Define = struct
 		| RealPosition
 		| ReplaceFiles
 		| Scriptable
+		| ShallowExpose
 		| Swc
 		| SwfCompressLevel
 		| SwfDebugPassword
@@ -216,6 +219,7 @@ module Define = struct
 		| SwfProtected
 		| SwfScriptTimeout
 		| Sys
+		| Unsafe
 		| UseNekoc
 		| UseRttiDoc
 		| Vcproj
@@ -252,6 +256,8 @@ module Define = struct
 		| JsFlatten -> ("js_flatten","Generate classes to use fewer object property lookups")
 		| Macro -> ("macro","Defined when we compile code in the macro context")
 		| MacroTimes -> ("macro_times","Display per-macro timing when used with --times")
+		| NetVer -> ("net_ver", "<version:20-45> Sets the .NET version to be targeted")
+		| NetTarget -> ("net_target", "<name> Sets the .NET target. Defaults to \"net\". xbox, micro (Micro Framework), compact (Compact Framework) are some valid values")
 		| NekoSource -> ("neko_source","Output neko source instead of bytecode")
 		| NekoV1 -> ("neko_v1","Keep Neko 1.x compatibility")
 		| NetworkSandbox -> ("network-sandbox","Use local network sandbox instead of local file access one")
@@ -269,6 +275,7 @@ module Define = struct
 		| RealPosition -> ("real_position","Disables haxe source mapping when targetting C#")
 		| ReplaceFiles -> ("replace_files","GenCommon internal")
 		| Scriptable -> ("scriptable","GenCPP internal")
+		| ShallowExpose -> ("shallow-expose","Expose types to surrounding scope of Haxe generated closure without writing to window object")
 		| Swc -> ("swc","Output a SWC instead of a SWF")
 		| SwfCompressLevel -> ("swf_compress_level","<level:1-9> Set the amount of compression for the SWF output")
 		| SwfDebugPassword -> ("swf_debug_password", "Set a password for debugging.")
@@ -280,6 +287,7 @@ module Define = struct
 		| SwfProtected -> ("swf_protected","Compile Haxe private as protected in the SWF instead of public")
 		| SwfScriptTimeout -> ("swf_script_timeout", "Maximum ActionScript processing time before script stuck dialog box displays (in seconds)")
 		| Sys -> ("sys","Defined for all system platforms")
+		| Unsafe -> ("unsafe","Allow unsafe code when targeting C#")
 		| UseNekoc -> ("use_nekoc","Use nekoc compiler instead of internal one")
 		| UseRttiDoc -> ("use_rtti_doc","Allows access to documentation during compilation")
 		| Vcproj -> ("vcproj","GenCPP internal")
@@ -409,6 +417,7 @@ module MetaInfo = struct
 		| Transient -> ":transient",("Adds the 'transient' flag to the class field",[Platform Java; UsedOn TClassField])
 		| ValueUsed -> ":valueUsed",("Internally used by DCE to mark an abstract value as used",[Internal])
 		| Volatile -> ":volatile",("",[Platforms [Java;Cs]])
+		| Unbound -> ":unbound", ("Compiler internal to denote unbounded global variable",[])
 		| UnifyMinDynamic -> ":unifyMinDynamic",("Allows a collection of types to unify to Dynamic",[UsedOn TClassField])
 		| Unreflective -> ":unreflective",("",[Platform Cpp])
 		| Unsafe -> ":unsafe",("Declares a class, or a method with the C#'s 'unsafe' flag",[Platform Cs; UsedOnEither [TClass;TClassField]])
@@ -455,7 +464,6 @@ let default_config =
 		pf_locals_scope = true;
 		pf_captured_scope = true;
 		pf_unique_locals = false;
-		pf_can_init_member = (fun _ -> true);
 		pf_capture_policy = CPNone;
 		pf_pad_nulls = false;
 		pf_add_final_return = false;
@@ -477,7 +485,6 @@ let get_config com =
 			pf_locals_scope = com.flash_version > 6.;
 			pf_captured_scope = false;
 			pf_unique_locals = false;
-			pf_can_init_member = (fun _ -> true);
 			pf_capture_policy = CPLoopVars;
 			pf_pad_nulls = false;
 			pf_add_final_return = false;
@@ -493,7 +500,6 @@ let get_config com =
 			pf_locals_scope = false;
 			pf_captured_scope = false;
 			pf_unique_locals = false;
-			pf_can_init_member = (fun _ -> false);
 			pf_capture_policy = CPLoopVars;
 			pf_pad_nulls = false;
 			pf_add_final_return = false;
@@ -509,7 +515,6 @@ let get_config com =
 			pf_locals_scope = true;
 			pf_captured_scope = true;
 			pf_unique_locals = false;
-			pf_can_init_member = (fun _ -> false);
 			pf_capture_policy = CPNone;
 			pf_pad_nulls = true;
 			pf_add_final_return = false;
@@ -525,7 +530,6 @@ let get_config com =
 			pf_locals_scope = false;
 			pf_captured_scope = true;
 			pf_unique_locals = true;
-			pf_can_init_member = (fun _ -> true);
 			pf_capture_policy = CPLoopVars;
 			pf_pad_nulls = false;
 			pf_add_final_return = true;
@@ -541,7 +545,6 @@ let get_config com =
 			pf_locals_scope = true;
 			pf_captured_scope = true; (* handled by genSwf9 *)
 			pf_unique_locals = false;
-			pf_can_init_member = (fun _ -> false);
 			pf_capture_policy = CPLoopVars;
 			pf_pad_nulls = false;
 			pf_add_final_return = false;
@@ -557,12 +560,6 @@ let get_config com =
 			pf_locals_scope = false; (* some duplicate work is done in genPhp *)
 			pf_captured_scope = false;
 			pf_unique_locals = false;
-			pf_can_init_member = (fun cf ->
-				match cf.cf_kind, cf.cf_expr with
-				| Var { v_write = AccCall },	_ -> false
-				| _, Some { eexpr = TTypeExpr _ } -> false
-				| _ -> true
-			);
 			pf_capture_policy = CPNone;
 			pf_pad_nulls = true;
 			pf_add_final_return = false;
@@ -578,7 +575,6 @@ let get_config com =
 			pf_locals_scope = true;
 			pf_captured_scope = true;
 			pf_unique_locals = false;
-			pf_can_init_member = (fun _ -> false);
 			pf_capture_policy = CPWrapRef;
 			pf_pad_nulls = true;
 			pf_add_final_return = true;
@@ -594,7 +590,6 @@ let get_config com =
 			pf_locals_scope = false;
 			pf_captured_scope = true;
 			pf_unique_locals = true;
-			pf_can_init_member = (fun _ -> false);
 			pf_capture_policy = CPWrapRef;
 			pf_pad_nulls = true;
 			pf_add_final_return = false;
@@ -610,7 +605,6 @@ let get_config com =
 			pf_locals_scope = false;
 			pf_captured_scope = true;
 			pf_unique_locals = false;
-			pf_can_init_member = (fun _ -> false);
 			pf_capture_policy = CPWrapRef;
 			pf_pad_nulls = true;
 			pf_add_final_return = false;
@@ -619,6 +613,8 @@ let get_config com =
 			pf_can_skip_non_nullable_argument = true;
 			pf_ignore_unsafe_cast = false;
 		}
+
+let memory_marker = [|Unix.time()|]
 
 let create v args =
 	let m = Type.mk_mono() in
@@ -652,6 +648,7 @@ let create v args =
 		swf_libs = [];
 		java_libs = [];
 		net_libs = [];
+		net_std = [];
 		net_path_map = Hashtbl.create 0;
 		neko_libs = [];
 		php_prefix = None;
@@ -670,6 +667,7 @@ let create v args =
 			tstring = m;
 			tarray = (fun _ -> assert false);
 		};
+		memory_marker = memory_marker;
 	}
 
 let log com str =
@@ -837,6 +835,9 @@ let normalize_path p =
 	else match p.[l-1] with
 		| '\\' | '/' -> p
 		| _ -> p ^ "/"
+
+let mem_size v =
+	Objsize.size_with_headers (Objsize.objsize v [] [])
 
 (* ------------------------- TIMERS ----------------------------- *)
 

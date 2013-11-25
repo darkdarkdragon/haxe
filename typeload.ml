@@ -76,6 +76,16 @@ let make_module ctx mpath file tdecls loadp =
 				e_extern = List.mem EExtern d.d_flags;
 				e_constrs = PMap.empty;
 				e_names = [];
+				e_type = {
+					t_path = fst path, "#" ^ snd path;
+					t_module = m;
+					t_doc = None;
+					t_pos = p;
+					t_type = mk_mono();
+					t_private = true;
+					t_types = [];
+					t_meta = [];
+				};
 			} in
 			decls := (TEnumDecl e, decl) :: !decls;
 			acc
@@ -184,8 +194,8 @@ let make_module ctx mpath file tdecls loadp =
 					List.iter (fun m -> match m with
 						| ((Meta.Build | Meta.CoreApi | Meta.Allow | Meta.Access),_,_) ->
 							c.cl_meta <- m :: c.cl_meta;
-						| (Meta.FakeEnum,_,_) ->
-							c.cl_meta <- (Meta.Build,[ECall((EField((EField((EField((EConst(Ident "haxe"),p),"macro"),p),"Build"),p),"buildFakeEnum"),p),[]),p],p) :: c.cl_meta;
+						| (Meta.Enum,_,_) ->
+							c.cl_meta <- (Meta.Build,[ECall((EField((EField((EField((EConst(Ident "haxe"),p),"macro"),p),"Build"),p),"buildEnumAbstract"),p),[]),p],p) :: c.cl_meta;
 						| (Meta.Expose,el,_) ->
 							c.cl_meta <- (Meta.Build,[ECall((EField((EField((EField((EConst(Ident "haxe"),p),"macro"),p),"Build"),p),"exposeUnderlyingFields"),p),el),p],p) :: c.cl_meta;
 						| _ ->
@@ -567,6 +577,7 @@ and init_meta_overloads ctx cf =
 let hide_types ctx =
 	let old_m = ctx.m in
 	let old_type_params = ctx.type_params in
+	let old_deps = ctx.g.std.m_extra.m_deps in
 	ctx.m <- {
 		curmod = ctx.g.std;
 		module_types = [];
@@ -578,6 +589,8 @@ let hide_types ctx =
 	(fun() ->
 		ctx.m <- old_m;
 		ctx.type_params <- old_type_params;
+		(* restore dependencies that might be have been wronly inserted *)
+		ctx.g.std.m_extra.m_deps <- old_deps;
 	)
 
 (*
@@ -587,6 +600,12 @@ let load_core_type ctx name =
 	let show = hide_types ctx in
 	let t = load_instance ctx { tpackage = []; tname = name; tparams = []; tsub = None; } null_pos false in
 	show();
+	add_dependency ctx.m.curmod (match t with
+	| TInst (c,_) -> c.cl_module
+	| TType (t,_) -> t.t_module
+	| TAbstract (a,_) -> a.a_module
+	| TEnum (e,_) -> e.e_module
+	| _ -> assert false);
 	t
 
 let t_iterator ctx =
@@ -594,6 +613,7 @@ let t_iterator ctx =
 	match load_type_def ctx null_pos { tpackage = []; tname = "Iterator"; tparams = []; tsub = None } with
 	| TTypeDecl t ->
 		show();
+		add_dependency ctx.m.curmod t.t_module;
 		if List.length t.t_types <> 1 then assert false;
 		let pt = mk_mono() in
 		apply_params t.t_types [pt] t.t_type, pt
@@ -858,8 +878,10 @@ let rec check_interface ctx c intf params =
 				valid_redefinition ctx f2 t2 f (apply_params intf.cl_types params f.cf_type)
 			with
 				Unify_error l ->
-					display_error ctx ("Field " ^ i ^ " has different type than in " ^ s_type_path intf.cl_path) p;
-					display_error ctx (error_msg (Unify l)) p;
+					if not (Meta.has Meta.CsNative c.cl_meta && c.cl_extern) then begin
+						display_error ctx ("Field " ^ i ^ " has different type than in " ^ s_type_path intf.cl_path) p;
+						display_error ctx (error_msg (Unify l)) p;
+					end
 		with
 			| Not_found when not c.cl_interface ->
 				let msg = if !is_overload then
@@ -1430,7 +1452,7 @@ let init_class ctx c p context_init herits fields =
 			true
 		else match parent with
 			| Some { cf_public = p } -> p
-			| _ -> c.cl_extern || c.cl_interface || extends_public || (match c.cl_kind with KAbstractImpl _ -> true | _ -> false)
+			| _ -> c.cl_extern || c.cl_interface || extends_public || (ctx.com.version < 30200 && match c.cl_kind with KAbstractImpl _ -> true | _ -> false)
 	in
 	let rec get_parent c name =
 		match c.cl_super with
@@ -1521,6 +1543,10 @@ let init_class ctx c p context_init herits fields =
 					context_init();
 					if ctx.com.verbose then Common.log ctx.com ("Typing " ^ (if ctx.in_macro then "macro " else "") ^ s_type_path c.cl_path ^ "." ^ cf.cf_name);
 					let e = type_var_field ctx t e stat p in
+					let require_constant_expression e msg = match Optimizer.make_constant_expression ctx e with
+						| Some e -> e
+						| None -> display_error ctx msg p; e
+					in
 					let e = (match cf.cf_kind with
 					| Var v when c.cl_extern || Meta.has Meta.Extern cf.cf_meta ->
 						if not stat then begin
@@ -1529,15 +1555,11 @@ let init_class ctx c p context_init herits fields =
 						end else if v.v_read <> AccInline then begin
 							display_error ctx "Extern non-inline variables may not be initialized" p;
 							e
-						end else begin
-							match Optimizer.make_constant_expression ctx e with
-							| Some e -> e
-							| None -> display_error ctx "Extern variable initialization must be a constant value" p; e
-						end
+						end else require_constant_expression e "Extern variable initialization must be a constant value"
 					| Var v when is_extern_field cf ->
 						(* disallow initialization of non-physical fields (issue #1958) *)
 						display_error ctx "This field cannot be initialized because it is not a real variable" p; e
-					| Var v when not stat || (v.v_read = AccInline) ->
+					| Var v when not stat ->
 						let e = match Optimizer.make_constant_expression ctx e with
 							| Some e -> e
 							| None ->
@@ -1550,6 +1572,9 @@ let init_class ctx c p context_init herits fields =
 								has_this e;
 								e
 						in
+						check_cast e
+					| Var v when v.v_read = AccInline ->
+						let e = require_constant_expression e "Inline variable initialization must be a constant value" in
 						check_cast e
 					| _ ->
 						e
@@ -1627,7 +1652,7 @@ let init_class ctx c p context_init herits fields =
 			} in
 			ctx.curfield <- cf;
 			bind_var ctx cf e stat inline;
-			f, false, cf
+			f, false, cf, true
 		| FFun fd ->
 			let params = type_function_params ctx fd f.cff_name p in
 			if inline && c.cl_interface then error "You can't declare inline methods in interfaces" p;
@@ -1647,9 +1672,9 @@ let init_class ctx c p context_init herits fields =
 			let fd = if not is_macro then
 				fd
 			else begin
-				(* a class with a macro cannot be extern in macro context (issue #2015) *)
-				c.cl_extern <- false;
-				if ctx.in_macro then
+				if ctx.in_macro then begin
+					(* a class with a macro cannot be extern in macro context (issue #2015) *)
+					c.cl_extern <- false;
 					let texpr = CTPath { tpackage = ["haxe";"macro"]; tname = "Expr"; tparams = []; tsub = None } in
 					(* ExprOf type parameter might contain platform-specific type, let's replace it by Expr *)
 					let no_expr_of = function
@@ -1659,11 +1684,11 @@ let init_class ctx c p context_init herits fields =
 					in
 					{
 						f_params = fd.f_params;
-						f_type = (match fd.f_type with None -> Some texpr | t -> t);
+						f_type = (match fd.f_type with None -> Some texpr | Some t -> no_expr_of t);
 						f_args = List.map (fun (a,o,t,e) -> a,o,(match t with None -> Some texpr | Some t -> no_expr_of t),e) fd.f_args;
 						f_expr = fd.f_expr;
 					}
-				else
+				end else
 					let tdyn = Some (CTPath { tpackage = []; tname = "Dynamic"; tparams = []; tsub = None }) in
 					let to_dyn = function
 						| { tpackage = ["haxe";"macro"]; tname = "Expr"; tsub = Some ("ExprOf"); tparams = [TPType t] } -> Some t
@@ -1713,12 +1738,24 @@ let init_class ctx c p context_init herits fields =
 				cf_params = params;
 				cf_overloads = [];
 			} in
-			let do_bind = ref (not (cf.cf_name <> "__init__" && (c.cl_extern && not inline) || c.cl_interface)) in
+			let do_bind = ref (((not c.cl_extern || inline) && not c.cl_interface) || cf.cf_name = "__init__") in
+			let do_add = ref true in
 			(match c.cl_kind with
 				| KAbstractImpl a ->
 					let m = mk_mono() in
 					let ta = TAbstract(a, List.map (fun _ -> mk_mono()) a.a_types) in
 					let tthis = if Meta.has Meta.Impl f.cff_meta || Meta.has Meta.To f.cff_meta then monomorphs a.a_types a.a_this else a.a_this in
+					let check_bind () =
+						if fd.f_expr = None then begin
+							if inline then error ("Inline functions must have an expression") f.cff_pos;
+							begin match fd.f_type with
+								| None -> error ("Functions without expressions must have an explicit return type") f.cff_pos
+								| Some _ -> ()
+							end;
+							do_add := false;
+							do_bind := false;
+						end
+					in
 					let rec loop ml = match ml with
 						| (Meta.From,_,_) :: _ ->
 							if is_macro then error "Macro cast functions are not supported" p;
@@ -1748,6 +1785,7 @@ let init_class ctx c p context_init herits fields =
 						| (Meta.ArrayAccess,_,_) :: _ ->
 							if is_macro then error "Macro array-access functions are not supported" p;
 							a.a_array <- cf :: a.a_array;
+							if Meta.has Meta.CoreType a.a_meta then check_bind();
 						| (Meta.Op,[EBinop(op,_,_),_],_) :: _ ->
 							if is_macro then error "Macro operator functions are not supported" p;
 							let targ = if Meta.has Meta.Impl f.cff_meta then tthis else ta in
@@ -1756,13 +1794,13 @@ let init_class ctx c p context_init herits fields =
 							if not (left_eq || right_eq) then error ("The left or right argument type must be " ^ (s_type (print_context()) targ)) f.cff_pos;
 							if right_eq && Meta.has Meta.Commutative f.cff_meta then error ("@:commutative is only allowed if the right argument is not " ^ (s_type (print_context()) targ)) f.cff_pos;
 							a.a_ops <- (op,cf) :: a.a_ops;
-							if fd.f_expr = None then do_bind := false;
+							check_bind();
 						| (Meta.Op,[EUnop(op,flag,_),_],_) :: _ ->
 							if is_macro then error "Macro operator functions are not supported" p;
 							let targ = if Meta.has Meta.Impl f.cff_meta then tthis else ta in
 							(try type_eq EqStrict t (tfun [targ] (mk_mono())) with Unify_error l -> raise (Error ((Unify l),f.cff_pos)));
 							a.a_unops <- (op,flag,cf) :: a.a_unops;
-							if fd.f_expr = None then do_bind := false;
+							check_bind();
 						| _ :: ml ->
 							loop ml
 						| [] ->
@@ -1806,7 +1844,7 @@ let init_class ctx c p context_init herits fields =
 				t
 			) "type_fun" in
 			if !do_bind then bind_type ctx cf r (match fd.f_expr with Some e -> snd e | None -> f.cff_pos) is_macro;
-			f, constr, cf
+			f, constr, cf, !do_add
 		| FProp (get,set,t,eo) ->
 			(match c.cl_kind with
 			| KAbstractImpl a when Meta.has Meta.Impl f.cff_meta ->
@@ -1883,7 +1921,7 @@ let init_class ctx c p context_init herits fields =
 			} in
 			ctx.curfield <- cf;
 			bind_var ctx cf eo stat inline;
-			f, false, cf
+			f, false, cf, true
 	in
 	let rec check_require = function
 		| [] -> None
@@ -1908,7 +1946,7 @@ let init_class ctx c p context_init herits fields =
 	List.iter (fun f ->
 		let p = f.cff_pos in
 		try
-			let fd , constr, f = loop_cf f in
+			let fd , constr, f, do_add = loop_cf f in
 			let is_static = List.mem AStatic fd.cff_access in
 			if (is_static || constr) && c.cl_interface && f.cf_name <> "__init__" then error "You can't declare static fields in interfaces" p;
 			begin try
@@ -1950,7 +1988,9 @@ let init_class ctx c p context_init herits fields =
 					else
 						display_error ctx ("Duplicate class field declaration : " ^ f.cf_name) p
 				else
-				if is_static then begin
+				if not do_add then
+					()
+				else if is_static then begin
 					c.cl_statics <- PMap.add f.cf_name f c.cl_statics;
 					c.cl_ordered_statics <- f :: c.cl_ordered_statics;
 				end else begin
@@ -2237,6 +2277,7 @@ let rec init_module_type ctx context_init do_init (decl,p) =
 		let names = ref [] in
 		let index = ref 0 in
 		let is_flat = ref true in
+		let fields = ref PMap.empty in
 		List.iter (fun c ->
 			let p = c.ec_pos in
 			let params = ref [] in
@@ -2267,7 +2308,7 @@ let rec init_module_type ctx context_init do_init (decl,p) =
 					) l, rt)
 			) in
 			if PMap.mem c.ec_name e.e_constrs then error ("Duplicate constructor " ^ c.ec_name) p;
-			e.e_constrs <- PMap.add c.ec_name {
+			let f = {
 				ef_name = c.ec_name;
 				ef_type = t;
 				ef_pos = p;
@@ -2275,12 +2316,34 @@ let rec init_module_type ctx context_init do_init (decl,p) =
 				ef_index = !index;
 				ef_params = params;
 				ef_meta = c.ec_meta;
-			} e.e_constrs;
+			} in
+			let cf = {
+				cf_name = f.ef_name;
+				cf_public = true;
+				cf_type = f.ef_type;
+				cf_kind = (match follow f.ef_type with
+					| TFun _ -> Method MethNormal
+					| _ -> Var { v_read = AccNormal; v_write = AccNo }
+				);
+				cf_pos = e.e_pos;
+				cf_doc = None;
+				cf_meta = no_meta;
+				cf_expr = None;
+				cf_params = f.ef_params;
+				cf_overloads = [];
+			} in
+			e.e_constrs <- PMap.add f.ef_name f e.e_constrs;
+			fields := PMap.add cf.cf_name cf !fields;
 			incr index;
 			names := c.ec_name :: !names;
 		) (!constructs);
 		e.e_names <- List.rev !names;
 		e.e_extern <- e.e_extern;
+		e.e_type.t_types <- e.e_types;
+		e.e_type.t_type <- TAnon {
+			a_fields = !fields;
+			a_status = ref (EnumStatics e);
+		};
 		if !is_flat then e.e_meta <- (Meta.FlatEnum,[],e.e_pos) :: e.e_meta;
 	| ETypedef d ->
 		let t = (match get_type d.d_name with TTypeDecl t -> t | _ -> assert false) in
@@ -2318,14 +2381,16 @@ let rec init_module_type ctx context_init do_init (decl,p) =
 			| AToType t -> a.a_to <- (load_type t false, None) :: a.a_to
 			| AIsType t ->
 				if a.a_impl = None then error "Abstracts with underlying type must have an implementation" a.a_pos;
+				if Meta.has Meta.CoreType a.a_meta then error "@:coreType abstracts cannot have an underlying type" p;
 				let at = load_complex_type ctx p t in
 				(match at with TAbstract(a2,_) when a == a2 -> error "Abstract underlying type cannot be recursive" a.a_pos | _ -> ());
 				a.a_this <- at;
 				is_type := true;
 			| APrivAbstract -> ()
-		) d.d_flags;
-		if not !is_type && (match a.a_impl with Some _ -> true | None -> not (Meta.has Meta.CoreType a.a_meta)) then
-			error "Abstract is missing underlying type declaration" a.a_pos
+		) d.d_flags
+		(* this was assuming that implementations imply underlying type, but that shouldn't be necessary (issue #2333) *)
+(* 		if not !is_type && (match a.a_impl with Some _ -> true | None -> not (Meta.has Meta.CoreType a.a_meta)) then
+			error "Abstract is missing underlying type declaration" a.a_pos *)
 
 let type_module ctx m file tdecls p =
 	let m, decls, tdecls = make_module ctx m file tdecls p in
@@ -2362,6 +2427,11 @@ let type_module ctx m file tdecls p =
 		opened = [];
 		vthis = None;
 	} in
+	if ctx.g.std != null_module then begin
+		add_dependency m ctx.g.std;
+		(* this will ensure both String and (indirectly) Array which are basic types which might be referenced *)
+		ignore(load_core_type ctx "String");
+	end;
 	(* here is an additional PASS 1 phase, which define the type parameters for all module types.
 		 Constraints are handled lazily (no other type is loaded) because they might be recursive anyway *)
 	List.iter (fun d ->
