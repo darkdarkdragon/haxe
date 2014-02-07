@@ -192,12 +192,8 @@ let make_module ctx mpath file tdecls loadp =
 				(match !decls with
 				| (TClassDecl c,_) :: _ ->
 					List.iter (fun m -> match m with
-						| ((Meta.Build | Meta.CoreApi | Meta.Allow | Meta.Access),_,_) ->
+						| ((Meta.Build | Meta.CoreApi | Meta.Allow | Meta.Access | Meta.Enum),_,_) ->
 							c.cl_meta <- m :: c.cl_meta;
-						| (Meta.Enum,_,_) ->
-							c.cl_meta <- (Meta.Build,[ECall((EField((EField((EField((EConst(Ident "haxe"),p),"macro"),p),"Build"),p),"buildEnumAbstract"),p),[]),p],p) :: c.cl_meta;
-						| (Meta.Expose,el,_) ->
-							c.cl_meta <- (Meta.Build,[ECall((EField((EField((EField((EConst(Ident "haxe"),p),"macro"),p),"Build"),p),"exposeUnderlyingFields"),p),el),p],p) :: c.cl_meta;
 						| _ ->
 							()
 					) a.a_meta;
@@ -419,11 +415,13 @@ and load_complex_type ctx p t =
 	| CTParent t -> load_complex_type ctx p t
 	| CTPath t -> load_instance ctx t p false
 	| CTOptional _ -> error "Optional type not allowed here" p
-	| CTExtend (t,l) ->
+	| CTExtend (tl,l) ->
 		(match load_complex_type ctx p (CTAnonymous l) with
-		| TAnon a ->
-			let rec loop t =
+		| TAnon a as ta ->
+			let mk_extension t =
 				match follow t with
+				| TInst ({cl_kind = KTypeParameter _},_) ->
+					error "Cannot structurally extend type parameters" p
 				| TInst (c,tl) ->
 					let c2 = mk_class null_module (fst c.cl_path,"+" ^ snd c.cl_path) p in
 					c2.cl_private <- true;
@@ -443,17 +441,31 @@ and load_complex_type ctx p t =
 					error "Loop found in cascading signatures definitions. Please change order/import" p
 				| TAnon a2 ->
 					PMap.iter (fun f _ ->
-						if PMap.mem f a2.a_fields then error ("Cannot redefine field " ^ f) p
+						if PMap.mem f a2.a_fields then error ("Cannot redefine field " ^ f) p;
 					) a.a_fields;
 					mk_anon (PMap.foldi PMap.add a.a_fields a2.a_fields)
 				| _ -> error "Can only extend classes and structures" p
 			in
-			let i = load_instance ctx t p false in
+			let loop t = match follow t with
+				| TAnon a2 ->
+					PMap.iter (fun f cf ->
+						if PMap.mem f a.a_fields then error ("Cannot redefine field " ^ f) p;
+						a.a_fields <- PMap.add f cf a.a_fields
+					) a2.a_fields
+				| _ ->
+					error "Multiple structural extension is only allowed for structures" p
+			in
+			let il = List.map (fun t -> load_instance ctx t p false) tl in
 			let tr = ref None in
 			let t = TMono tr in
 			let r = exc_protect ctx (fun r ->
 				r := (fun _ -> t);
-				tr := Some (loop i);
+				tr := Some (match il with
+					| [i] ->
+						mk_extension i
+					| _ ->
+						List.iter loop il;
+						ta);
 				t
 			) "constraint" in
 			delay ctx PForce (fun () -> ignore(!r()));
@@ -1154,6 +1166,7 @@ let type_function_params ctx fd fname p =
 let type_function ctx args ret fmode f do_display p =
 	let locals = save_locals ctx in
 	let fargs = List.map (fun (n,c,t) ->
+		if n.[0] = '$' then error "Function argument names starting with a dollar are not allowed" p;
 		let c = (match c with
 			| None -> None
 			| Some e ->
@@ -1180,6 +1193,10 @@ let type_function ctx args ret fmode f do_display p =
 		type_expr ctx (Optimizer.optimize_completion_expr e) NoValue
 	with DisplayTypes [TMono _] | Parser.TypePath (_,None) | Exit ->
 		type_expr ctx e NoValue
+	in
+	let e = match e.eexpr with
+		| TMeta((Meta.MergeBlock,_,_), ({eexpr = TBlock el} as e1)) -> e1
+		| _ -> e
 	in
 	let rec loop e =
 		match e.eexpr with
@@ -1216,7 +1233,7 @@ let type_function ctx args ret fmode f do_display p =
 	locals();
 	let e = match ctx.curfun, ctx.vthis with
 		| (FunMember|FunConstructor), Some v ->
-			let ev = mk (TVars [v,Some (mk (TConst TThis) ctx.tthis p)]) ctx.t.tvoid p in
+			let ev = mk (TVar (v,Some (mk (TConst TThis) ctx.tthis p))) ctx.t.tvoid p in
 			(match e.eexpr with
 			| TBlock l -> { e with eexpr = TBlock (ev::l) }
 			| _ -> mk (TBlock [ev;e]) e.etype p)
@@ -1369,6 +1386,26 @@ let rec string_list_of_expr_path (e,p) =
 	| EField (e,f) -> f :: string_list_of_expr_path e
 	| _ -> error "Invalid path" p
 
+let build_enum_abstract ctx c a fields p =
+	List.iter (fun field ->
+		match field.cff_kind with
+		| FVar(ct,eo) when not (List.mem AStatic field.cff_access) ->
+			begin match ct with
+				| Some _ -> error "Type hints on enum abstract fields are not allowed" field.cff_pos
+				| None -> ()
+			end;
+			field.cff_access <- [AStatic;APublic;AInline];
+			field.cff_meta <- (Meta.Enum,[],field.cff_pos) :: (Meta.Impl,[],field.cff_pos) :: field.cff_meta;
+ 			let e = match eo with
+				| None -> error "Value required" field.cff_pos
+				| Some e -> (ECast(e,None),field.cff_pos)
+			in
+			field.cff_kind <- FVar(ct,Some e)
+		| _ ->
+			()
+	) fields;
+	EVars ["",Some (CTAnonymous fields),None],p
+
 let build_module_def ctx mt meta fvars context_init fbuild =
 	let rec loop = function
 		| (Meta.Build,args,p) :: l ->
@@ -1386,6 +1423,16 @@ let build_module_def ctx mt meta fvars context_init fbuild =
 			(match r with
 			| None -> error "Build failure" p
 			| Some e -> fbuild e; loop l)
+		| (Meta.Enum,_,p) :: l ->
+			begin match mt with
+				| TClassDecl ({cl_kind = KAbstractImpl a} as c) ->
+					context_init();
+					let e = build_enum_abstract ctx c a (fvars()) p in
+					fbuild e;
+					loop l
+				| _ ->
+					loop l
+			end
 		| _ :: l -> loop l
 		| [] -> ()
 	in
@@ -1575,6 +1622,16 @@ let init_class ctx c p context_init herits fields =
 						check_cast e
 					| Var v when v.v_read = AccInline ->
 						let e = require_constant_expression e "Inline variable initialization must be a constant value" in
+						begin match c.cl_kind with
+							| KAbstractImpl a when Meta.has Meta.Enum cf.cf_meta && Meta.has Meta.Enum a.a_meta ->
+								unify ctx (TAbstract(a,(List.map (fun _ -> mk_mono()) a.a_types))) t p;
+								begin match e.eexpr with
+									| TCast(e1,None) -> unify ctx e1.etype a.a_this e1.epos
+									| _ -> assert false
+								end
+							| _ ->
+								()
+						end;
 						check_cast e
 					| _ ->
 						e

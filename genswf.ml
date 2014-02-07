@@ -525,26 +525,6 @@ let tag ?(ext=false) d = {
 	tdata = d;
 }
 
-let swf_ver = function
-	| 6. -> 6
-	| 7. -> 7
-	| 8. -> 8
-	| 9. -> 9
-	| 10. | 10.1 -> 10
-	| 10.2 -> 11
-	| 10.3 -> 12
-	| 11. -> 13
-	| 11.1 -> 14
-	| 11.2 -> 15
-	| 11.3 -> 16
-	| 11.4 -> 17
-	| 11.5 -> 18
-	| 11.6 -> 19
-	| 11.7 -> 20
-	| 11.8 -> 21
-	| 11.9 -> 22
-	| v -> failwith ("Invalid SWF version " ^ float_repres v)
-
 let convert_header com (w,h,fps,bg) =
 	let high = (max w h) * 20 in
 	let rec loop b =
@@ -552,7 +532,7 @@ let convert_header com (w,h,fps,bg) =
 	in
 	let bits = loop 0 in
 	{
-		h_version = swf_ver com.flash_version;
+		h_version = Common.flash_version_tag com.flash_version;
 		h_size = {
 			rect_nbits = bits + 1;
 			left = 0;
@@ -588,7 +568,8 @@ let build_dependencies t =
 			(match c.cl_kind with KTypeParameter _ -> () | _ -> add_path c.cl_path DKType);
 			List.iter (add_type_rec (t::l)) pl;
 		| TAbstract (a,pl) ->
-			add_path a.a_path DKType;
+			if Meta.has Meta.CoreType a.a_meta then
+				add_path a.a_path DKType;
 			List.iter (add_type_rec (t::l)) pl;
 		| TFun (pl,t2) ->
 			List.iter (fun (_,_,t2) -> add_type_rec (t::l) t2) pl;
@@ -623,13 +604,12 @@ let build_dependencies t =
 			add_type v.v_type;
 			add_expr e1;
 			add_expr e2;
-		| TVars vl ->
-			List.iter (fun (v,e) ->
+		| TVar (v,eo) ->
 				add_type v.v_type;
-				match e with
+			begin match eo with
 				| None -> ()
 				| Some e -> add_expr e
-			) vl
+			end
 		| _ ->
 			Type.iter add_expr e
 	and add_field f =
@@ -1032,7 +1012,7 @@ let build_swf9 com file swc =
 
 let merge com file priority (h1,tags1) (h2,tags2) =
   (* prioritize header+bgcolor for first swf *)
-	let header = if priority then { h2 with h_version = max h2.h_version (swf_ver com.flash_version) } else h1 in
+	let header = if priority then { h2 with h_version = max h2.h_version (Common.flash_version_tag com.flash_version) } else h1 in
 	let tags1 = if priority then List.filter (function { tdata = TSetBgColor _ } -> false | _ -> true) tags1 else tags1 in
   (* remove unused tags *)
 	let use_stage = priority && Common.defined com Define.FlashUseStage in

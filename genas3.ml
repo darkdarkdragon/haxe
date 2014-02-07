@@ -648,18 +648,15 @@ and gen_expr ctx e =
 	| TThrow e ->
 		spr ctx "throw ";
 		gen_value ctx e;
-	| TVars [] ->
-		()
-	| TVars vl ->
+	| TVar (v,eo) ->
 		spr ctx "var ";
-		concat ctx ", " (fun (v,eo) ->
-			print ctx "%s : %s" (s_ident v.v_name) (type_str ctx v.v_type e.epos);
-			match eo with
-			| None -> ()
-			| Some e ->
-				spr ctx " = ";
-				gen_value ctx e
-		) vl;
+		print ctx "%s : %s" (s_ident v.v_name) (type_str ctx v.v_type e.epos);
+		begin match eo with
+		| None -> ()
+		| Some e ->
+			spr ctx " = ";
+			gen_value ctx e
+		end
 	| TNew (c,params,el) ->
 		(match c.cl_path, params with
 		| (["flash"],"Vector"), [pt] -> print ctx "new Vector.<%s>(" (type_str ctx pt e.epos)
@@ -747,9 +744,14 @@ and gen_expr ctx e =
 		);
 		spr ctx "}"
 	| TCast (e1,None) ->
-		spr ctx "((";
-		gen_expr ctx e1;
-		print ctx ") as %s)" (type_str ctx e.etype e.epos);
+		let s = type_str ctx e.etype e.epos in
+		if s = "*" then
+			gen_expr ctx e1
+		else begin
+			spr ctx "((";
+			gen_value ctx e1;
+			print ctx ") as %s)" s
+		end
 	| TCast (e1,Some t) ->
 		gen_expr ctx (Codegen.default_cast ctx.inf.com e1 t e.etype e.epos)
 
@@ -847,7 +849,7 @@ and gen_value ctx e =
 	| TBreak
 	| TContinue ->
 		unsupported e.epos
-	| TVars _
+	| TVar _
 	| TFor _
 	| TWhile _
 	| TThrow _ ->
@@ -928,7 +930,8 @@ let generate_field ctx static f =
 			print ctx "]";
 		| _ -> ()
 	) f.cf_meta;
-	let public = f.cf_public || Hashtbl.mem ctx.get_sets (f.cf_name,static) || (f.cf_name = "main" && static) || f.cf_name = "resolve" || Ast.Meta.has Ast.Meta.Public f.cf_meta in
+	let public = f.cf_public || Hashtbl.mem ctx.get_sets (f.cf_name,static) || (f.cf_name = "main" && static)
+	    || f.cf_name = "resolve" || Ast.Meta.has Ast.Meta.Public f.cf_meta || (match ctx.curclass.cl_kind with KAbstractImpl _ -> Ast.Meta.has Ast.Meta.Op f.cf_meta | _ -> false) in
 	let rights = (if static then "static " else "") ^ (if public then "public" else "protected") in
 	let p = ctx.curclass.cl_pos in
 	match f.cf_expr, f.cf_kind with
