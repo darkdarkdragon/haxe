@@ -62,6 +62,10 @@ let keep_whole_class dce c =
 		| { cl_path = [],"Array" } -> not (dce.com.platform = Js)
 		| _ -> false)
 
+let keep_whole_enum dce en =
+	Meta.has Meta.Keep en.e_meta
+	|| not (dce.full || is_std_file dce en.e_module.m_extra.m_file || has_meta Meta.Dce en.e_meta)
+
 (* check if a field is kept *)
 let keep_field dce cf =
 	Meta.has Meta.Keep cf.cf_meta
@@ -217,8 +221,11 @@ let rec to_string dce t = match t with
 			dce.ts_stack <- t :: dce.ts_stack;
 			to_string dce (apply_params tt.t_types tl tt.t_type)
 		end
-	| TAbstract(a,tl) ->
-		to_string dce (Codegen.Abstract.get_underlying_type a tl)
+	| TAbstract({a_impl = Some c} as a,tl) ->
+		if Meta.has Meta.CoreType a.a_meta then
+			field dce c "toString" false
+		else
+			to_string dce (Codegen.Abstract.get_underlying_type a tl)
 	| TMono r ->
 		(match !r with
 		| Some t -> to_string dce t
@@ -230,7 +237,7 @@ let rec to_string dce t = match t with
 			()
 		else
 			to_string dce t
-	| TEnum _ | TFun _ | TAnon _ ->
+	| TEnum _ | TFun _ | TAnon _ | TAbstract({a_impl = None},_) ->
 		(* if we to_string these it does not imply that we need all its sub-types *)
 		()
 
@@ -407,6 +414,8 @@ let run com main full =
 				| Some cf -> loop false cf
 				| None -> ()
 			end
+		| TEnumDecl en when keep_whole_enum dce en ->
+			mark_enum dce en
 		| _ ->
 			()
 	) com.types;
@@ -501,7 +510,7 @@ let run com main full =
 					if dce.debug then print_endline ("[DCE] Removed class " ^ (s_type_path c.cl_path));
 					loop acc l)
 			end
- 		| (TEnumDecl e) as mt :: l when Meta.has Meta.Used e.e_meta || Meta.has Meta.Keep e.e_meta || e.e_extern || not (dce.full || is_std_file dce e.e_module.m_extra.m_file || has_meta Meta.Dce e.e_meta) ->
+ 		| (TEnumDecl en) as mt :: l when Meta.has Meta.Used en.e_meta || en.e_extern || keep_whole_enum dce en ->
 			loop (mt :: acc) l
 		| TEnumDecl e :: l ->
 			if dce.debug then print_endline ("[DCE] Removed enum " ^ (s_type_path e.e_path));

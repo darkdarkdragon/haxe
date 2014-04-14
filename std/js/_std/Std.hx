@@ -27,7 +27,7 @@ import js.Boot;
 	public static inline function is( v : Dynamic, t : Dynamic ) : Bool {
 		return untyped js.Boot.__instanceof(v,t);
 	}
-	
+
 	public static inline function instance<T:{},S:T>( value : T, c : Class<S> ) : S {
 		return untyped __instanceof__(value, c) ? cast value : null;
 	}
@@ -90,6 +90,8 @@ import js.Boot;
 		__feature__("Void.*",{
 			var Void = __feature__("Type.resolveEnum", $hxClasses["Void"] = { __ename__ : ["Void"] }, { __ename__ : ["Void"] });
 		});
+
+#if !js_es5
 		__feature__("Array.map",
 			if( Array.prototype.map == null )
 				Array.prototype.map = function(f) {
@@ -110,6 +112,7 @@ import js.Boot;
 					return a;
 				}
 		);
+#end
 	}
 
 }

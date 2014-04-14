@@ -77,7 +77,7 @@ let make_module ctx mpath file tdecls loadp =
 				e_constrs = PMap.empty;
 				e_names = [];
 				e_type = {
-					t_path = fst path, "#" ^ snd path;
+					t_path = [], "Enum<" ^ (s_type_path path) ^ ">";
 					t_module = m;
 					t_doc = None;
 					t_pos = p;
@@ -177,11 +177,7 @@ let make_module ctx mpath file tdecls loadp =
 						{ f with cff_name = "_new"; cff_access = AStatic :: f.cff_access; cff_kind = FFun fu; cff_meta = (Meta.Impl,[],p) :: f.cff_meta }
 					| FFun fu when not stat ->
 						if Meta.has Meta.From f.cff_meta then error "@:from cast functions must be static" f.cff_pos;
-						let first = if List.mem AMacro f.cff_access
-							then CTPath ({ tpackage = ["haxe";"macro"]; tname = "Expr"; tsub = Some ("ExprOf"); tparams = [TPType this_t] })
-							else this_t
-						in
-						let fu = { fu with f_args = ("this",false,Some first,None) :: fu.f_args } in
+						let fu = { fu with f_args = (if List.mem AMacro f.cff_access then fu.f_args else ("this",false,Some this_t,None) :: fu.f_args) } in
 						{ f with cff_kind = FFun fu; cff_access = AStatic :: f.cff_access; cff_meta = (Meta.Impl,[],p) :: f.cff_meta }
 					| _ ->
 						f
@@ -527,6 +523,7 @@ and load_complex_type ctx p t =
 					let t = (match t with None -> error "Type required for structure property" p | Some t -> t) in
 					load_complex_type ctx p t, Var { v_read = access i1 true; v_write = access i2 false }
 			) in
+			let t = if Meta.has Meta.Optional f.cff_meta then ctx.t.tnull t else t in
 			let cf = {
 				cf_name = n;
 				cf_type = t;
@@ -536,7 +533,7 @@ and load_complex_type ctx p t =
 				cf_params = !params;
 				cf_expr = None;
 				cf_doc = f.cff_doc;
-			cf_meta = f.cff_meta;
+				cf_meta = f.cff_meta;
 				cf_overloads = [];
 			} in
 			init_meta_overloads ctx cf;
@@ -769,17 +766,16 @@ let check_overloads ctx c =
 		) (f :: f.cf_overloads)) (c.cl_ordered_fields @ c.cl_ordered_statics)
 
 let check_overriding ctx c =
-	let p = c.cl_pos in
 	match c.cl_super with
 	| None ->
 		(match c.cl_overrides with
 		| [] -> ()
 		| i :: _ ->
-			display_error ctx ("Field " ^ i.cf_name ^ " is declared 'override' but doesn't override any field") p)
+			display_error ctx ("Field " ^ i.cf_name ^ " is declared 'override' but doesn't override any field") i.cf_pos)
 	| Some (csup,params) ->
 		PMap.iter (fun i f ->
+			let p = f.cf_pos in
 			let check_field f get_super_field is_overload = try
-				let p = f.cf_pos in
 				(if is_overload && not (Meta.has Meta.Overload f.cf_meta) then
 					display_error ctx ("Missing @:overload declaration for field " ^ i) p);
 				let t, f2 = get_super_field csup i in
@@ -996,7 +992,7 @@ let check_extends ctx c t p = match follow t with
 		end
 	| _ -> error "Should extend by using a class" p
 
-let rec add_constructor ctx c p =
+let rec add_constructor ctx c force_constructor p =
 	match c.cl_constructor, c.cl_super with
 	| None, Some ({ cl_constructor = Some cfsup } as csup,cparams) when not c.cl_extern ->
 		let cf = {
@@ -1050,6 +1046,18 @@ let rec add_constructor ctx c p =
 		cf.cf_type <- TLazy r;
 		c.cl_constructor <- Some cf;
 		delay ctx PForce (fun() -> ignore((!r)()));
+	| None,_ when force_constructor ->
+		let constr = mk (TFunction {
+			tf_args = [];
+			tf_type = ctx.t.tvoid;
+			tf_expr = mk (TBlock []) ctx.t.tvoid p;
+		}) (tfun [] ctx.t.tvoid) p in
+		let cf = mk_field "new" constr.etype p in
+		cf.cf_expr <- Some constr;
+		cf.cf_type <- constr.etype;
+		cf.cf_meta <- [Meta.CompilerGenerated,[],p];
+		cf.cf_kind <- Method MethNormal;
+		c.cl_constructor <- Some cf;
 	| _ ->
 		(* nothing to do *)
 		()
@@ -1091,7 +1099,7 @@ let set_heritance ctx c herits p =
 				intf.cl_build();
 				if is_parent c intf then error "Recursive class" p;
 				if c.cl_interface then error "Interfaces cannot implement another interface (use extends instead)" p;
-				if not intf.cl_interface then error "You can only implements an interface" p;
+				if not intf.cl_interface then error "You can only implement an interface" p;
 				process_meta intf;
 				c.cl_implements <- (intf, params) :: c.cl_implements;
 				if not !has_interf then begin
@@ -1173,9 +1181,12 @@ let type_function ctx args ret fmode f do_display p =
 				let p = pos e in
 				let e = ctx.g.do_optimize ctx (type_expr ctx e (WithType t)) in
 				unify ctx e.etype t p;
-				match e.eexpr with
-				| TConst c -> Some c
-				| _ -> display_error ctx "Parameter default value should be constant" p; None
+				let rec loop e = match e.eexpr with
+					| TConst c -> Some c
+					| TCast(e,None) -> loop e
+					| _ -> display_error ctx "Parameter default value should be constant" p; None
+				in
+				loop e
 		) in
 		let v,c = add_local ctx n t, c in
 		if n = "this" then v.v_meta <- (Meta.This,[],p) :: v.v_meta;
@@ -1220,16 +1231,34 @@ let type_function ctx args ret fmode f do_display p =
 	in
 	let has_super_constr() =
 		match ctx.curclass.cl_super with
-		| None -> false
-		| Some (csup,_) ->
-			try ignore(get_constructor (fun f->f.cf_type) csup); true with Not_found -> false
+		| None ->
+			None
+		| Some (csup,tl) ->
+			try
+				let _,cf = get_constructor (fun f->f.cf_type) csup in
+				Some (Meta.has Meta.CompilerGenerated cf.cf_meta,TInst(csup,tl))
+			with Not_found ->
+				None
 	in
-	if fmode = FunConstructor && has_super_constr() then
-		(try
-			loop e;
-			display_error ctx "Missing super constructor call" p
-		with
-			Exit -> ());
+	let e = if fmode <> FunConstructor then
+		e
+	else match has_super_constr() with
+		| Some (was_forced,t_super) ->
+			(try
+				loop e;
+				if was_forced then
+					let e_super = mk (TConst TSuper) t_super e.epos in
+					let e_super_call = mk (TCall(e_super,[])) ctx.t.tvoid e.epos in
+					concat e_super_call e
+				else begin
+					display_error ctx "Missing super constructor call" p;
+					e
+				end
+			with
+				Exit -> e);
+		| None ->
+			e
+	in
 	locals();
 	let e = match ctx.curfun, ctx.vthis with
 		| (FunMember|FunConstructor), Some v ->
@@ -1416,7 +1445,7 @@ let build_module_def ctx mt meta fvars context_init fbuild =
 			let s = try String.concat "." (List.rev (string_list_of_expr_path epath)) with Error (_,p) -> error "Build call parameter must be a class path" p in
 			if ctx.in_macro then error "You cannot use @:build inside a macro : make sure that your enum is not used in macro" p;
 			let old = ctx.g.get_build_infos in
-			ctx.g.get_build_infos <- (fun() -> Some (mt, fvars()));
+			ctx.g.get_build_infos <- (fun() -> Some (mt, List.map snd (t_infos mt).mt_types, fvars()));
 			context_init();
 			let r = try apply_macro ctx MBuild s el p with e -> ctx.g.get_build_infos <- old; raise e in
 			ctx.g.get_build_infos <- old;
@@ -1499,7 +1528,7 @@ let init_class ctx c p context_init herits fields =
 			true
 		else match parent with
 			| Some { cf_public = p } -> p
-			| _ -> c.cl_extern || c.cl_interface || extends_public || (ctx.com.version < 30200 && match c.cl_kind with KAbstractImpl _ -> true | _ -> false)
+			| _ -> c.cl_extern || c.cl_interface || extends_public
 	in
 	let rec get_parent c name =
 		match c.cl_super with
@@ -1568,6 +1597,8 @@ let init_class ctx c p context_init herits fields =
 			delayed_expr := (ctx,Some r) :: !delayed_expr;
 		end
 	in
+
+	let force_constructor = ref false in
 
 	let bind_var ctx cf e stat inline =
 		let p = cf.cf_pos in
@@ -1641,6 +1672,7 @@ let init_class ctx c p context_init herits fields =
 				end;
 				t
 			) "bind_var" in
+			if not stat then force_constructor := true;
 			bind_type ctx cf r (snd e) false
 	in
 
@@ -1838,7 +1870,11 @@ let init_class ctx c p context_init herits fields =
 							(* the first argument of a to-function must be the underlying type, not the abstract *)
 							(try unify_raise ctx t (tfun (tthis :: args) m) f.cff_pos with Error (Unify l,p) -> error (error_msg (Unify l)) p);
 							if not (Meta.has Meta.Impl cf.cf_meta) then cf.cf_meta <- (Meta.Impl,[],cf.cf_pos) :: cf.cf_meta;
-							a.a_to <- (follow m, Some cf) :: a.a_to
+							let m = match follow m with
+								| TMono _ when (match cf.cf_type with TFun(_,r) -> r == t_dynamic | _ -> false) -> t_dynamic
+								| m -> m
+							in
+							a.a_to <- (m, Some cf) :: a.a_to
 						| (Meta.ArrayAccess,_,_) :: _ ->
 							if is_macro then error "Macro array-access functions are not supported" p;
 							a.a_array <- cf :: a.a_array;
@@ -1846,8 +1882,15 @@ let init_class ctx c p context_init herits fields =
 						| (Meta.Op,[EBinop(op,_,_),_],_) :: _ ->
 							if is_macro then error "Macro operator functions are not supported" p;
 							let targ = if Meta.has Meta.Impl f.cff_meta then tthis else ta in
-							let left_eq = type_iseq t (tfun [targ;m] (mk_mono())) in
-							let right_eq = type_iseq t (tfun [mk_mono();targ] (mk_mono())) in
+							let left_eq,right_eq = match follow t with
+								| TFun([(_,_,t1);(_,_,t2)],_) ->
+									type_iseq targ t1,type_iseq targ t2
+								| _ ->
+									if Meta.has Meta.Impl cf.cf_meta then
+										error "Member @:op functions must accept exactly one argument" cf.cf_pos
+									else
+										error "Static @:op functions must accept exactly two arguments" cf.cf_pos
+							in
 							if not (left_eq || right_eq) then error ("The left or right argument type must be " ^ (s_type (print_context()) targ)) f.cff_pos;
 							if right_eq && Meta.has Meta.Commutative f.cff_meta then error ("@:commutative is only allowed if the right argument is not " ^ (s_type (print_context()) targ)) f.cff_pos;
 							a.a_ops <- (op,cf) :: a.a_ops;
@@ -1988,6 +2031,7 @@ let init_class ctx c p context_init herits fields =
 				| e :: l ->
 					let sc = match fst e with
 						| EConst (Ident s) -> s
+						| EBinop ((OpEq|OpNotEq|OpGt|OpGte|OpLt|OpLte) as op,(EConst (Ident s),_),(EConst ((Int _ | Float _ | String _) as c),_)) -> s ^ s_binop op ^ s_constant c
 						| _ -> ""
 					in
 					if not (Parser.is_true (Parser.eval ctx.com e)) then
@@ -2071,7 +2115,7 @@ let init_class ctx c p context_init herits fields =
 		make sure a default contructor with same access as super one will be added to the class structure at some point.
 	*)
 	(* add_constructor does not deal with overloads correctly *)
-	if not ctx.com.config.pf_overload then add_constructor ctx c p;
+	if not ctx.com.config.pf_overload then add_constructor ctx c !force_constructor p;
 	(* check overloaded constructors *)
 	(if ctx.com.config.pf_overload then match c.cl_constructor with
 	| Some ctor ->
@@ -2267,6 +2311,7 @@ let rec init_module_type ctx context_init do_init (decl,p) =
 		let c = (match get_type d.d_name with TClassDecl c -> c | _ -> assert false) in
 		let herits = d.d_flags in
 		if Meta.has Meta.Generic c.cl_meta && c.cl_types <> [] then c.cl_kind <- KGeneric;
+		if Meta.has Meta.GenericBuild c.cl_meta then c.cl_kind <- KGenericBuild d.d_data;
 		if c.cl_path = (["haxe";"macro"],"MacroType") then c.cl_kind <- KMacroType;
 		c.cl_extern <- List.mem HExtern herits;
 		c.cl_interface <- List.mem HInterface herits;
@@ -2409,7 +2454,10 @@ let rec init_module_type ctx context_init do_init (decl,p) =
 		(*
 			we exceptionnaly allow follow here because we don't care the type we get as long as it's not our own
 		*)
-		if t.t_type == follow tt then error "Recursive typedef is not allowed" p;
+		(match d.d_data with
+		| CTExtend _ -> ()
+		| _ ->
+			if t.t_type == follow tt then error "Recursive typedef is not allowed" p);
 		(match t.t_type with
 		| TMono r ->
 			(match !r with
@@ -2444,10 +2492,13 @@ let rec init_module_type ctx context_init do_init (decl,p) =
 				a.a_this <- at;
 				is_type := true;
 			| APrivAbstract -> ()
-		) d.d_flags
-		(* this was assuming that implementations imply underlying type, but that shouldn't be necessary (issue #2333) *)
-(* 		if not !is_type && (match a.a_impl with Some _ -> true | None -> not (Meta.has Meta.CoreType a.a_meta)) then
-			error "Abstract is missing underlying type declaration" a.a_pos *)
+		) d.d_flags;
+		if not !is_type then begin
+			if Meta.has Meta.CoreType a.a_meta then
+				a.a_this <- TAbstract(a,List.map snd a.a_types)
+			else
+				error "Abstract is missing underlying type declaration" a.a_pos
+		end
 
 let type_module ctx m file tdecls p =
 	let m, decls, tdecls = make_module ctx m file tdecls p in
@@ -2466,6 +2517,7 @@ let type_module ctx m file tdecls p =
 		};
 		meta = [];
 		this_stack = [];
+		with_type_stack = [];
 		pass = PBuildModule;
 		on_error = (fun ctx msg p -> ctx.com.error msg p);
 		macro_depth = ctx.macro_depth;
